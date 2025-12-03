@@ -56,16 +56,43 @@ pub enum AggregateFunction {
     Max { expr: Box<Expr> },
 }
 
-/// Table reference
+/// Table reference (can be a table or a JOIN)
 #[derive(Debug, Clone)]
-pub struct TableRef {
-    pub name: String,
+pub enum TableRef {
+    Table {
+        name: String,
+        alias: Option<String>,
+    },
+    Join {
+        left: Box<TableRef>,
+        right: Box<TableRef>,
+        join_type: JoinType,
+        condition: Option<JoinCondition>,
+    },
+}
+
+/// JOIN type
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    FullOuter,
+    Cross,
+}
+
+/// JOIN condition
+#[derive(Debug, Clone)]
+pub enum JoinCondition {
+    On(Expr),  // ON condition
+    Using(Vec<String>),  // USING (col1, col2, ...)
 }
 
 /// Expression
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Column(String),
+    Column(String),  // Simple column name
+    QualifiedColumn { table: String, column: String },  // table.column
     Literal(Value),
     BinaryOp {
         left: Box<Expr>,

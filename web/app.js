@@ -57,7 +57,65 @@ document.addEventListener('keydown', function(e) {
 window.addEventListener('DOMContentLoaded', function() {
     // Wait for Monaco editor to be ready
     setTimeout(loadTables, 500);
+    
+    // Initialize sidebar resizer
+    initSidebarResizer();
 });
+
+// Sidebar resizer functionality
+function initSidebarResizer() {
+    const sidebar = document.getElementById('sidebar');
+    const resizer = document.getElementById('resizer');
+    
+    // Load saved sidebar width from localStorage
+    const savedWidth = localStorage.getItem('sidebarWidth');
+    if (savedWidth) {
+        sidebar.style.width = savedWidth + 'px';
+    }
+    
+    let isResizing = false;
+    let startX = 0;
+    let startWidth = 0;
+    
+    resizer.addEventListener('mousedown', function(e) {
+        isResizing = true;
+        startX = e.clientX;
+        startWidth = parseInt(window.getComputedStyle(sidebar).width, 10);
+        
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', stopResizing);
+        
+        e.preventDefault();
+    });
+    
+    function handleMouseMove(e) {
+        if (!isResizing) return;
+        
+        const width = startWidth + e.clientX - startX;
+        const minWidth = 150;
+        const maxWidth = 600;
+        
+        if (width >= minWidth && width <= maxWidth) {
+            sidebar.style.width = width + 'px';
+            
+            // Update Monaco editor layout if it exists
+            if (editor) {
+                editor.layout();
+            }
+        }
+    }
+    
+    function stopResizing() {
+        isResizing = false;
+        
+        // Save sidebar width to localStorage
+        const currentWidth = parseInt(window.getComputedStyle(sidebar).width, 10);
+        localStorage.setItem('sidebarWidth', currentWidth);
+        
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', stopResizing);
+    }
+}
 
 async function executeQuery() {
     const query = editor.getValue();
@@ -71,6 +129,9 @@ async function executeQuery() {
     // Show loading state
     resultsContainer.innerHTML = '<div class="loading">Executing query</div>';
     
+    // Start timing
+    const startTime = performance.now();
+    
     try {
         const response = await fetch('/api/execute', {
             method: 'POST',
@@ -82,11 +143,15 @@ async function executeQuery() {
         
         const data = await response.json();
         
+        // Calculate execution time
+        const endTime = performance.now();
+        const executionTime = endTime - startTime;
+        
         if (data.success) {
             if (data.result) {
-                displayResults(data.result);
+                displayResults(data.result, executionTime);
             } else {
-                showSuccess('Query executed successfully (no results)');
+                showSuccess(`Query executed successfully (no results) - Execution time: ${formatExecutionTime(executionTime)}`);
             }
         } else {
             showError(data.error || 'Unknown error occurred');
@@ -96,17 +161,17 @@ async function executeQuery() {
     }
 }
 
-function displayResults(result) {
+function displayResults(result, executionTime) {
     const resultsContainer = document.getElementById('results-container');
     const MAX_DISPLAY_ROWS = 1000;
     
     if (!result.columns || result.columns.length === 0) {
-        resultsContainer.innerHTML = '<div class="info-message">Query executed successfully (no columns)</div>';
+        resultsContainer.innerHTML = `<div class="info-message">Query executed successfully (no columns) - Execution time: ${formatExecutionTime(executionTime)}</div>`;
         return;
     }
     
     if (!result.rows || result.rows.length === 0) {
-        resultsContainer.innerHTML = '<div class="info-message">Query executed successfully (0 rows returned)</div>';
+        resultsContainer.innerHTML = `<div class="info-message">Query executed successfully (0 rows returned) - Execution time: ${formatExecutionTime(executionTime)}</div>`;
         return;
     }
     
@@ -115,6 +180,11 @@ function displayResults(result) {
     const isTruncated = totalRows > MAX_DISPLAY_ROWS;
     
     let html = '';
+    
+    // Show execution time at the top
+    html += `<div class="info-message" style="margin-bottom: 15px;">
+        <strong>⏱️ EXECUTION TIME:</strong> ${formatExecutionTime(executionTime)}
+    </div>`;
     
     // Show warning if results are truncated
     if (isTruncated) {
@@ -153,6 +223,23 @@ function displayResults(result) {
     }
     
     resultsContainer.innerHTML = html;
+}
+
+function formatExecutionTime(milliseconds) {
+    if (milliseconds < 1) {
+        return `${(milliseconds * 1000).toFixed(2)} microseconds`;
+    } else if (milliseconds < 1000) {
+        return `${milliseconds.toFixed(2)} ms`;
+    } else {
+        const seconds = milliseconds / 1000;
+        if (seconds < 60) {
+            return `${seconds.toFixed(2)} seconds`;
+        } else {
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = seconds % 60;
+            return `${minutes}m ${remainingSeconds.toFixed(2)}s`;
+        }
+    }
 }
 
 function formatValue(value) {
@@ -250,11 +337,80 @@ function displayTables(tables) {
     document.querySelectorAll('.table-item').forEach(item => {
         item.addEventListener('click', function() {
             const tableName = this.getAttribute('data-table');
+            
+            // Remove selected class from all table items
+            document.querySelectorAll('.table-item').forEach(i => {
+                i.classList.remove('selected');
+            });
+            
+            // Add selected class to clicked item
+            this.classList.add('selected');
+            
+            // Load table schema
+            loadTableSchema(tableName);
+            
+            // Insert SELECT query into editor
             if (editor) {
                 editor.setValue(`SELECT * FROM ${tableName};`);
                 editor.focus();
             }
         });
     });
+}
+
+// Load table schema from API
+async function loadTableSchema(tableName) {
+    const tableInfo = document.getElementById('table-info');
+    const tableInfoContent = tableInfo.querySelector('.table-info-content');
+    
+    // Show loading state
+    tableInfoContent.innerHTML = '<div class="loading">Loading schema</div>';
+    
+    try {
+        const response = await fetch(`/api/table/${encodeURIComponent(tableName)}`);
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const text = await response.text();
+        if (!text || text.trim() === '') {
+            throw new Error('Empty response from server');
+        }
+        
+        const data = JSON.parse(text);
+        
+        if (data.success && data.schema) {
+            displayTableSchema(data.schema);
+        } else {
+            tableInfoContent.innerHTML = `<div class="error-message">${escapeHtml(data.error || 'Failed to load table schema')}</div>`;
+        }
+    } catch (error) {
+        tableInfoContent.innerHTML = `<div class="error-message">Failed to load table schema: ${escapeHtml(error.message)}</div>`;
+    }
+}
+
+// Display table schema information
+function displayTableSchema(schema) {
+    const tableInfo = document.getElementById('table-info');
+    const tableInfoContent = tableInfo.querySelector('.table-info-content');
+    
+    let html = `<h3 class="table-info-title">${escapeHtml(schema.name)}</h3>`;
+    html += '<div class="table-info-columns">';
+    
+    if (schema.columns && schema.columns.length > 0) {
+        schema.columns.forEach(column => {
+            html += `<div class="table-info-column">`;
+            html += `<span class="table-info-column-name">${escapeHtml(column.name)}</span>`;
+            html += `<span class="table-info-column-type">${escapeHtml(column.data_type)}</span>`;
+            html += `</div>`;
+        });
+    } else {
+        html += '<div class="empty-state"><p>No columns found</p></div>';
+    }
+    
+    html += '</div>';
+    
+    tableInfoContent.innerHTML = html;
 }
 

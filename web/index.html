@@ -15,7 +15,7 @@
         </header>
         
         <div class="main-content">
-            <div class="sidebar">
+            <div class="sidebar" id="sidebar">
                 <div class="sidebar-header">
                     <h2>Tables</h2>
                     <button id="refresh-tables-btn" class="refresh-btn" title="Refresh tables">↻</button>
@@ -25,7 +25,14 @@
                         <p>No tables found</p>
                     </div>
                 </div>
+                <div id="table-info" class="table-info">
+                    <div class="table-info-content">
+                        <p class="table-info-placeholder">Click on a table to see its schema</p>
+                    </div>
+                </div>
             </div>
+            
+            <div class="resizer" id="resizer"></div>
             
             <div class="query-results-column">
                 <div class="query-section">

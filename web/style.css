@@ -4,12 +4,18 @@
     box-sizing: border-box;
 }
 
+html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+}
+
 body {
     font-family: 'Courier New', 'Courier', monospace;
     background: #FFE66D;
-    min-height: 100vh;
-    padding: 0;
-    margin: 0;
+    display: flex;
+    flex-direction: column;
 }
 
 .container {
@@ -20,7 +26,7 @@ body {
     border-radius: 0;
     overflow: hidden;
     box-shadow: none;
-    min-height: 100vh;
+    height: 100vh;
     display: flex;
     flex-direction: column;
 }
@@ -48,23 +54,58 @@ header h1 {
 }
 
 .main-content {
-    display: grid;
-    grid-template-columns: 250px 1fr;
+    display: flex;
     gap: 0;
     padding: 0;
     flex: 1;
     min-height: 0;
+    position: relative;
 }
 
 .sidebar {
     display: flex;
     flex-direction: column;
     border-right: 5px solid #000000;
+    background: #4ECDC4;
+    padding: 20px;
+    height: 100%;
+    min-height: 0;
+    width: 250px;
+    min-width: 150px;
+    max-width: 600px;
+    flex-shrink: 0;
+    resize: none;
+    overflow: hidden;
+    align-self: stretch;
+}
+
+.resizer {
+    width: 8px;
+    background: #000000;
+    cursor: col-resize;
+    flex-shrink: 0;
+    position: relative;
+    z-index: 10;
+    transition: background 0.2s;
+    align-self: stretch;
+    height: 100%;
+}
+
+.resizer:hover {
+    background: #FF6B6B;
+}
+
+.resizer:active {
+    background: #FF6B6B;
 }
 
 .query-results-column {
     display: flex;
     flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    overflow: hidden;
 }
 
 .query-section, .results-section {
@@ -74,14 +115,6 @@ header h1 {
 
 .query-section {
     border-bottom: 5px solid #000000;
-}
-
-.sidebar {
-    background: #4ECDC4;
-    border-right: 5px solid #000000;
-    padding: 20px;
-    height: 100%;
-    min-height: 0;
 }
 
 .sidebar-header {
@@ -133,6 +166,75 @@ header h1 {
 .tables-list {
     overflow-y: auto;
     flex: 1;
+    min-height: 0;
+    margin-bottom: 15px;
+}
+
+.table-info {
+    border-top: 4px solid #000000;
+    padding-top: 15px;
+    max-height: 300px;
+    overflow-y: auto;
+    flex-shrink: 0;
+}
+
+.table-info-content {
+    background: #FFFFFF;
+    border: 4px solid #000000;
+    border-radius: 0;
+    padding: 15px;
+    box-shadow: 4px 4px 0px 0px #000000;
+}
+
+.table-info-placeholder {
+    color: #000000;
+    font-weight: 700;
+    text-align: center;
+    margin: 0;
+    text-transform: uppercase;
+    font-size: 0.9em;
+}
+
+.table-info-title {
+    color: #000000;
+    font-weight: 900;
+    font-size: 1.2em;
+    margin: 0 0 10px 0;
+    text-transform: uppercase;
+    border-bottom: 3px solid #000000;
+    padding-bottom: 8px;
+}
+
+.table-info-columns {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.table-info-column {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px;
+    background: #FFE66D;
+    border: 2px solid #000000;
+    font-weight: 700;
+    font-size: 0.9em;
+}
+
+.table-info-column-name {
+    color: #000000;
+    text-transform: uppercase;
+    font-weight: 900;
+}
+
+.table-info-column-type {
+    color: #000000;
+    text-transform: uppercase;
+    font-weight: 700;
+    background: #95E1D3;
+    padding: 4px 8px;
+    border: 2px solid #000000;
 }
 
 .table-items {
@@ -164,6 +266,12 @@ header h1 {
 .table-item:active {
     transform: translate(2px, 2px);
     box-shadow: 2px 2px 0px 0px #000000;
+}
+
+.table-item.selected {
+    background: #95E1D3;
+    border-color: #000000;
+    box-shadow: 4px 4px 0px 0px #000000;
 }
 
 .query-section {
@@ -360,13 +468,19 @@ header h1 {
 
 @media (max-width: 1024px) {
     .main-content {
-        grid-template-columns: 1fr;
+        flex-direction: column;
     }
     
     .sidebar {
+        width: 100% !important;
+        max-width: 100%;
         border-right: none;
         border-bottom: 5px solid #000000;
         min-height: 300px;
+    }
+    
+    .resizer {
+        display: none;
     }
     
     .query-section {

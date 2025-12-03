@@ -17,9 +17,14 @@ pub async fn start_server(db: Arc<Mutex<Database>>) -> anyhow::Result<()> {
     
     println!("Serving static files from: {:?}", web_dir);
     
-    let app = Router::new()
+    // API routes must come before static file service
+    let api_routes = Router::new()
         .route("/api/execute", post(handlers::execute_query))
         .route("/api/tables", get(handlers::list_tables))
+        .route("/api/table/:name", get(handlers::get_table_schema));
+    
+    let app = Router::new()
+        .merge(api_routes)
         .nest_service("/", ServeDir::new(web_dir))
         .layer(CorsLayer::permissive())
         .with_state(db);

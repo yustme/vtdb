@@ -64,6 +64,19 @@ impl Database {
     pub fn list_tables(&self) -> Vec<String> {
         self.catalog.list_tables()
     }
+
+    /// Get table schema information
+    pub fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
+        let table = self.catalog.get_table(table_name)?;
+        Ok(TableSchema {
+            name: table.name.clone(),
+            columns: table.columns.iter().map(|col| ColumnInfo {
+                name: col.name.clone(),
+                data_type: col.data_type.name().to_string(),
+                ordinal: col.ordinal,
+            }).collect(),
+        })
+    }
 }
 
 impl Default for Database {
@@ -77,6 +90,21 @@ impl Default for Database {
 pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
     pub columns: Vec<String>,
+}
+
+/// Table schema information
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TableSchema {
+    pub name: String,
+    pub columns: Vec<ColumnInfo>,
+}
+
+/// Column information
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,
+    pub ordinal: usize,
 }
 
 /// Database value types

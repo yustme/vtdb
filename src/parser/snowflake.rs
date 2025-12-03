@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Assignment as SqlAssignment, BinaryOperator as SqlBinaryOperator, Expr as SqlExpr,
-    SelectItem as SqlSelectItem, Statement as SqlStatement, TableFactor,
-    Values as SqlValues,
+    JoinOperator, SelectItem as SqlSelectItem, Statement as SqlStatement, TableFactor,
+    TableWithJoins, Values as SqlValues,
 };
 
 use crate::catalog::types::DataType;
@@ -46,6 +46,16 @@ pub fn convert_statement(stmt: SqlStatement) -> Result<Statement> {
                                     normalize_identifier(ident.to_string()),
                                 ));
                             }
+                            SqlExpr::CompoundIdentifier(parts) => {
+                                // Qualified column name: table.column
+                                if parts.len() == 2 {
+                                    let table = normalize_identifier(parts[0].to_string());
+                                    let column = normalize_identifier(parts[1].to_string());
+                                    select_items.push(SelectItem::Column(format!("{}.{}", table, column)));
+                                } else {
+                                    return Err(anyhow!("Unsupported compound identifier: {:?}", parts));
+                                }
+                            }
                             SqlExpr::Function(function) => {
                                 let func_name = normalize_identifier(function.name.to_string());
                                 let aggregate_func = convert_aggregate_function(&func_name, function)?;
@@ -67,14 +77,7 @@ pub fn convert_statement(stmt: SqlStatement) -> Result<Statement> {
             }
 
             let from = if let Some(from) = &select.from.first() {
-                match &from.relation {
-                    TableFactor::Table { name, .. } => {
-                        Some(TableRef {
-                            name: normalize_identifier(name.to_string()),
-                        })
-                    }
-                    _ => return Err(anyhow!("Unsupported FROM clause")),
-                }
+                Some(convert_table_with_joins(from)?)
             } else {
                 None
             };
@@ -93,18 +96,22 @@ pub fn convert_statement(stmt: SqlStatement) -> Result<Statement> {
                     return Err(anyhow!("GROUP BY ALL not supported"));
                 }
                 sqlparser::ast::GroupByExpr::Expressions(exprs) => {
-                    Some(
-                        exprs
-                            .iter()
-                            .map(|expr| {
-                                if let SqlExpr::Identifier(ident) = expr {
-                                    Ok(normalize_identifier(ident.to_string()))
-                                } else {
-                                    Err(anyhow!("GROUP BY only supports column names"))
-                                }
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    )
+                    if exprs.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            exprs
+                                .iter()
+                                .map(|expr| {
+                                    if let SqlExpr::Identifier(ident) = expr {
+                                        Ok(normalize_identifier(ident.to_string()))
+                                    } else {
+                                        Err(anyhow!("GROUP BY only supports column names"))
+                                    }
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                        )
+                    }
                 }
             };
 
@@ -264,6 +271,16 @@ fn convert_data_type(sql_type: &sqlparser::ast::DataType) -> Result<DataType> {
 fn convert_expr(expr: &SqlExpr) -> Result<Expr> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(Expr::Column(normalize_identifier(ident.to_string()))),
+        SqlExpr::CompoundIdentifier(parts) => {
+            // Qualified column name: table.column
+            if parts.len() == 2 {
+                let table = normalize_identifier(parts[0].to_string());
+                let column = normalize_identifier(parts[1].to_string());
+                Ok(Expr::QualifiedColumn { table, column })
+            } else {
+                Err(anyhow!("Unsupported compound identifier: {:?}", parts))
+            }
+        }
         SqlExpr::Value(val) => Ok(Expr::Literal(convert_value(val)?)),
         SqlExpr::BinaryOp { left, op, right } => {
             let left_expr = convert_expr(left)?;
@@ -416,6 +433,84 @@ fn convert_aggregate_function(
         }
         _ => Err(anyhow!("Unsupported aggregate function: {}", name)),
     }
+}
+
+/// Convert TableWithJoins from sqlparser to our TableRef
+fn convert_table_with_joins(table_with_joins: &TableWithJoins) -> Result<TableRef> {
+    // Convert the base table
+    let mut current_table = match &table_with_joins.relation {
+        TableFactor::Table { name, alias, .. } => {
+            let table_name = normalize_identifier(name.to_string());
+            let table_alias = alias.as_ref().map(|a| normalize_identifier(a.name.to_string()));
+            TableRef::Table {
+                name: table_name,
+                alias: table_alias,
+            }
+        }
+        _ => return Err(anyhow!("Unsupported table factor in FROM clause")),
+    };
+
+    // Process JOINs
+    for join in &table_with_joins.joins {
+        let right_table = match &join.relation {
+            TableFactor::Table { name, alias, .. } => {
+                let table_name = normalize_identifier(name.to_string());
+                let table_alias = alias.as_ref().map(|a| normalize_identifier(a.name.to_string()));
+                TableRef::Table {
+                    name: table_name,
+                    alias: table_alias,
+                }
+            }
+            _ => return Err(anyhow!("Unsupported table factor in JOIN")),
+        };
+
+        // Convert JOIN type
+        let join_type = match &join.join_operator {
+            JoinOperator::Inner(_) => JoinType::Inner,
+            JoinOperator::LeftOuter(_) => JoinType::Left,
+            JoinOperator::RightOuter(_) => JoinType::Right,
+            JoinOperator::FullOuter(_) => JoinType::FullOuter,
+            JoinOperator::CrossJoin => JoinType::Cross,
+            _ => return Err(anyhow!("Unsupported JOIN type: {:?}", join.join_operator)),
+        };
+
+        // Convert JOIN condition
+        let condition = match &join.join_operator {
+            JoinOperator::Inner(condition) | 
+            JoinOperator::LeftOuter(condition) | 
+            JoinOperator::RightOuter(condition) | 
+            JoinOperator::FullOuter(condition) => {
+                match condition {
+                    sqlparser::ast::JoinConstraint::On(expr) => {
+                        Some(JoinCondition::On(convert_expr(expr)?))
+                    }
+                    sqlparser::ast::JoinConstraint::Using(columns) => {
+                        let cols: Result<Vec<String>> = columns
+                            .iter()
+                            .map(|c| Ok(normalize_identifier(c.to_string())))
+                            .collect();
+                        Some(JoinCondition::Using(cols?))
+                    }
+                    sqlparser::ast::JoinConstraint::Natural => {
+                        return Err(anyhow!("NATURAL JOIN not yet supported"));
+                    }
+                    sqlparser::ast::JoinConstraint::None => None,
+                }
+            }
+            JoinOperator::CrossJoin => None,
+            _ => None,
+        };
+
+        // Build the JOIN
+        current_table = TableRef::Join {
+            left: Box::new(current_table),
+            right: Box::new(right_table),
+            join_type,
+            condition,
+        };
+    }
+
+    Ok(current_table)
 }
 
 /// Normalize identifier (remove quotes, handle case)

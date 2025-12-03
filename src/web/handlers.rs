@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::Json,
 };
@@ -78,5 +78,38 @@ pub async fn list_tables(
         tables,
         error: None,
     }))
+}
+
+#[derive(Serialize)]
+pub struct TableSchemaResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<crate::TableSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Get table schema information
+pub async fn get_table_schema(
+    State(db): State<Arc<Mutex<Database>>>,
+    Path(table_name): Path<String>,
+) -> Result<Json<TableSchemaResponse>, StatusCode> {
+    let schema = {
+        let db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db.get_table_schema(&table_name)
+    };
+
+    match schema {
+        Ok(schema) => Ok(Json(TableSchemaResponse {
+            success: true,
+            schema: Some(schema),
+            error: None,
+        })),
+        Err(e) => Ok(Json(TableSchemaResponse {
+            success: false,
+            schema: None,
+            error: Some(e.to_string()),
+        })),
+    }
 }
 

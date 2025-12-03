@@ -8,7 +8,7 @@ pub enum PhysicalPlan {
         columns: Vec<(String, crate::catalog::types::DataType)>,
     },
     Select {
-        table: String,
+        from: TableRef,
         columns: Vec<SelectItem>,
         filter: Option<Expr>,
         group_by: Option<Vec<String>>,

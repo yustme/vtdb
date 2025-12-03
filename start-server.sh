@@ -6,8 +6,11 @@
 set -e
 
 echo "Building VTDB server..."
-cargo build --bin vtdb-server
+cargo build --release
 
-echo "Starting server on http://localhost:8080..."
-cargo run --bin vtdb-server
+echo "Starting VTDB server on http://localhost:8080..."
+echo "Press Ctrl+C to stop the server"
+echo ""
+
+cargo run --release
 
