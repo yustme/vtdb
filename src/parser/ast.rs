@@ -31,6 +31,7 @@ pub struct Select {
     pub columns: Vec<SelectItem>,
     pub from: Option<TableRef>,
     pub where_clause: Option<Expr>,
+    pub group_by: Option<Vec<String>>,
     pub limit: Option<u64>,
 }
 
@@ -39,6 +40,20 @@ pub struct Select {
 pub enum SelectItem {
     Column(String),
     All,
+    FunctionCall {
+        name: String,
+        function: AggregateFunction,
+    },
+}
+
+/// Aggregate function
+#[derive(Debug, Clone)]
+pub enum AggregateFunction {
+    Count { distinct: bool, expr: Option<Box<Expr>> }, // None = COUNT(*)
+    Sum { distinct: bool, expr: Box<Expr> },
+    Avg { distinct: bool, expr: Box<Expr> },
+    Min { expr: Box<Expr> },
+    Max { expr: Box<Expr> },
 }
 
 /// Table reference

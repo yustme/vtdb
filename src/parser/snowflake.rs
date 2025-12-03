@@ -40,12 +40,23 @@ pub fn convert_statement(stmt: SqlStatement) -> Result<Statement> {
             for item in &select.projection {
                 match item {
                     SqlSelectItem::UnnamedExpr(expr) => {
-                        if let SqlExpr::Identifier(ident) = expr {
-                            select_items.push(SelectItem::Column(
-                                normalize_identifier(ident.to_string()),
-                            ));
-                        } else {
-                            return Err(anyhow!("Complex expressions not yet supported"));
+                        match expr {
+                            SqlExpr::Identifier(ident) => {
+                                select_items.push(SelectItem::Column(
+                                    normalize_identifier(ident.to_string()),
+                                ));
+                            }
+                            SqlExpr::Function(function) => {
+                                let func_name = normalize_identifier(function.name.to_string());
+                                let aggregate_func = convert_aggregate_function(&func_name, function)?;
+                                select_items.push(SelectItem::FunctionCall {
+                                    name: func_name,
+                                    function: aggregate_func,
+                                });
+                            }
+                            _ => {
+                                return Err(anyhow!("Complex expressions not yet supported: {:?}", expr));
+                            }
                         }
                     }
                     SqlSelectItem::Wildcard(_) => {
@@ -74,6 +85,29 @@ pub fn convert_statement(stmt: SqlStatement) -> Result<Statement> {
                 .map(|expr| convert_expr(expr))
                 .transpose()?;
 
+            // Parse GROUP BY clause
+            // In sqlparser 0.40, group_by might be structured differently
+            // Let's check if it's a vector or something else
+            let group_by = match &select.group_by {
+                sqlparser::ast::GroupByExpr::All => {
+                    return Err(anyhow!("GROUP BY ALL not supported"));
+                }
+                sqlparser::ast::GroupByExpr::Expressions(exprs) => {
+                    Some(
+                        exprs
+                            .iter()
+                            .map(|expr| {
+                                if let SqlExpr::Identifier(ident) = expr {
+                                    Ok(normalize_identifier(ident.to_string()))
+                                } else {
+                                    Err(anyhow!("GROUP BY only supports column names"))
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    )
+                }
+            };
+
             // Parse LIMIT clause (Snowflake supports LIMIT n)
             let limit = query.limit.as_ref().and_then(|limit_expr| {
                 // LIMIT can be an expression, but we'll handle simple integer literals
@@ -88,6 +122,7 @@ pub fn convert_statement(stmt: SqlStatement) -> Result<Statement> {
                 columns: select_items,
                 from,
                 where_clause,
+                group_by,
                 limit,
             }))
         }
@@ -280,6 +315,107 @@ fn convert_assignment(assign: &SqlAssignment) -> Result<Assignment> {
     };
     let value = convert_expr(&assign.value)?;
     Ok(Assignment { column, value })
+}
+
+/// Convert aggregate function from sqlparser
+fn convert_aggregate_function(
+    name: &str,
+    function: &sqlparser::ast::Function,
+) -> Result<AggregateFunction> {
+    let distinct = function.distinct;
+    
+    match name {
+        "COUNT" => {
+            if function.args.is_empty() {
+                // COUNT(*)
+                Ok(AggregateFunction::Count {
+                    distinct: false,
+                    expr: None,
+                })
+            } else if function.args.len() == 1 {
+                // COUNT(expr) or COUNT(DISTINCT expr)
+                let arg = &function.args[0];
+                match arg {
+                    sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => {
+                        // COUNT(*)
+                        Ok(AggregateFunction::Count {
+                            distinct: false,
+                            expr: None,
+                        })
+                    }
+                    sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                        // COUNT(column) or COUNT(DISTINCT column)
+                        Ok(AggregateFunction::Count {
+                            distinct,
+                            expr: Some(Box::new(convert_expr(expr)?)),
+                        })
+                    }
+                    _ => Err(anyhow!("Unsupported COUNT argument")),
+                }
+            } else {
+                Err(anyhow!("COUNT() takes at most one argument"))
+            }
+        }
+        "SUM" => {
+            if function.args.len() != 1 {
+                return Err(anyhow!("SUM() requires exactly one argument"));
+            }
+            let arg = &function.args[0];
+            match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                    Ok(AggregateFunction::Sum {
+                        distinct,
+                        expr: Box::new(convert_expr(expr)?),
+                    })
+                }
+                _ => Err(anyhow!("Unsupported SUM argument")),
+            }
+        }
+        "AVG" => {
+            if function.args.len() != 1 {
+                return Err(anyhow!("AVG() requires exactly one argument"));
+            }
+            let arg = &function.args[0];
+            match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                    Ok(AggregateFunction::Avg {
+                        distinct,
+                        expr: Box::new(convert_expr(expr)?),
+                    })
+                }
+                _ => Err(anyhow!("Unsupported AVG argument")),
+            }
+        }
+        "MIN" => {
+            if function.args.len() != 1 {
+                return Err(anyhow!("MIN() requires exactly one argument"));
+            }
+            let arg = &function.args[0];
+            match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                    Ok(AggregateFunction::Min {
+                        expr: Box::new(convert_expr(expr)?),
+                    })
+                }
+                _ => Err(anyhow!("Unsupported MIN argument")),
+            }
+        }
+        "MAX" => {
+            if function.args.len() != 1 {
+                return Err(anyhow!("MAX() requires exactly one argument"));
+            }
+            let arg = &function.args[0];
+            match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                    Ok(AggregateFunction::Max {
+                        expr: Box::new(convert_expr(expr)?),
+                    })
+                }
+                _ => Err(anyhow!("Unsupported MAX argument")),
+            }
+        }
+        _ => Err(anyhow!("Unsupported aggregate function: {}", name)),
+    }
 }
 
 /// Normalize identifier (remove quotes, handle case)

@@ -1,6 +1,6 @@
 use crate::Database;
 use axum::{
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,7 @@ pub async fn start_server(db: Arc<Mutex<Database>>) -> anyhow::Result<()> {
     
     let app = Router::new()
         .route("/api/execute", post(handlers::execute_query))
+        .route("/api/tables", get(handlers::list_tables))
         .nest_service("/", ServeDir::new(web_dir))
         .layer(CorsLayer::permissive())
         .with_state(db);

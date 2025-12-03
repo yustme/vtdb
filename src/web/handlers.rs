@@ -22,6 +22,14 @@ pub struct ExecuteResponse {
     pub error: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct ListTablesResponse {
+    pub success: bool,
+    pub tables: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Execute a SQL query
 pub async fn execute_query(
     State(db): State<Arc<Mutex<Database>>>,
@@ -54,5 +62,21 @@ pub async fn execute_query(
             error: Some(e.to_string()),
         })),
     }
+}
+
+/// List all tables in the database
+pub async fn list_tables(
+    State(db): State<Arc<Mutex<Database>>>,
+) -> Result<Json<ListTablesResponse>, StatusCode> {
+    let tables = {
+        let db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db.list_tables()
+    };
+
+    Ok(Json(ListTablesResponse {
+        success: true,
+        tables,
+        error: None,
+    }))
 }
 

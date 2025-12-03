@@ -11,6 +11,7 @@ pub enum PhysicalPlan {
         table: String,
         columns: Vec<SelectItem>,
         filter: Option<Expr>,
+        group_by: Option<Vec<String>>,
         limit: Option<u64>,
     },
     Insert {

@@ -26,6 +26,11 @@ impl Schema {
     pub fn has_table(&self, name: &str) -> bool {
         self.tables.contains_key(name)
     }
+
+    /// List all table names in this schema
+    pub fn list_tables(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
 }
 
 /// Table metadata

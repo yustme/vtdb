@@ -3,27 +3,60 @@ let editor;
 // Initialize Monaco Editor
 require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
 require(['vs/editor/editor.main'], function () {
+    // Define neobrutalist theme
+    monaco.editor.defineTheme('neobrutalist', {
+        base: 'vs',
+        inherit: true,
+        rules: [
+            { token: 'comment', foreground: '000000', fontStyle: 'bold' },
+            { token: 'keyword', foreground: 'FF6B6B', fontStyle: 'bold' },
+            { token: 'string', foreground: '4ECDC4', fontStyle: 'bold' },
+            { token: 'number', foreground: '95E1D3', fontStyle: 'bold' },
+            { token: 'operator', foreground: '000000', fontStyle: 'bold' },
+        ],
+        colors: {
+            'editor.background': '#FFFFFF',
+            'editor.foreground': '#000000',
+            'editor.lineHighlightBackground': '#FFE66D',
+            'editor.selectionBackground': '#FF6B6B',
+            'editorCursor.foreground': '#000000',
+            'editorLineNumber.foreground': '#000000',
+            'editorLineNumber.activeForeground': '#FF6B6B',
+        }
+    });
+    
     editor = monaco.editor.create(document.getElementById('editor'), {
         value: '-- Enter your SQL query here\nSELECT * FROM users;',
         language: 'sql',
-        theme: 'vs-dark',
+        theme: 'neobrutalist',
         automaticLayout: true,
         minimap: { enabled: false },
-        fontSize: 14,
+        fontSize: 16,
         lineNumbers: 'on',
         roundedSelection: false,
         scrollBeyondLastLine: false,
+        fontWeight: '700',
+        fontFamily: "'Courier New', 'Courier', monospace",
     });
 });
 
 // Execute query
 document.getElementById('execute-btn').addEventListener('click', executeQuery);
 
+// Refresh tables button
+document.getElementById('refresh-tables-btn').addEventListener('click', loadTables);
+
 // Execute on Ctrl+Enter
 document.addEventListener('keydown', function(e) {
     if (e.ctrlKey && e.key === 'Enter') {
         executeQuery();
     }
+});
+
+// Load tables on page load
+window.addEventListener('DOMContentLoaded', function() {
+    // Wait for Monaco editor to be ready
+    setTimeout(loadTables, 500);
 });
 
 async function executeQuery() {
@@ -146,5 +179,69 @@ function loadExample(query) {
         editor.setValue(query);
         editor.focus();
     }
+}
+
+// Load tables from API
+async function loadTables() {
+    const tablesList = document.getElementById('tables-list');
+    
+    // Show loading state
+    tablesList.innerHTML = '<div class="loading">Loading tables</div>';
+    
+    try {
+        const response = await fetch('/api/tables');
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const text = await response.text();
+        if (!text || text.trim() === '') {
+            throw new Error('Empty response from server');
+        }
+        
+        const data = JSON.parse(text);
+        
+        if (data.success) {
+            if (data.tables && Array.isArray(data.tables) && data.tables.length > 0) {
+                displayTables(data.tables);
+            } else {
+                tablesList.innerHTML = '<div class="empty-state"><p>No tables found</p></div>';
+            }
+        } else {
+            tablesList.innerHTML = `<div class="error-message">${escapeHtml(data.error || 'Failed to load tables')}</div>`;
+        }
+    } catch (error) {
+        tablesList.innerHTML = `<div class="error-message">Failed to load tables: ${escapeHtml(error.message)}</div>`;
+    }
+}
+
+// Display tables in the sidebar
+function displayTables(tables) {
+    const tablesList = document.getElementById('tables-list');
+    
+    if (!tables || tables.length === 0) {
+        tablesList.innerHTML = '<div class="empty-state"><p>No tables found</p></div>';
+        return;
+    }
+    
+    let html = '<div class="table-items">';
+    tables.forEach(tableName => {
+        html += `<div class="table-item" data-table="${escapeHtml(tableName)}">${escapeHtml(tableName)}</div>`;
+    });
+    html += '</div>';
+    
+    tablesList.innerHTML = html;
+    
+    // Add click handlers to table items
+    document.querySelectorAll('.table-item').forEach(item => {
+        item.addEventListener('click', function() {
+            const tableName = this.getAttribute('data-table');
+            if (editor) {
+                editor.setValue(`SELECT * FROM ${tableName};`);
+                editor.focus();
+            }
+        });
+    });
 }
 

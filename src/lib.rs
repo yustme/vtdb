@@ -59,6 +59,11 @@ impl Database {
 
         Ok(result)
     }
+
+    /// List all tables in the database
+    pub fn list_tables(&self) -> Vec<String> {
+        self.catalog.list_tables()
+    }
 }
 
 impl Default for Database {
@@ -75,7 +80,7 @@ pub struct QueryResult {
 }
 
 /// Database value types
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(tag = "type", content = "value")]
 pub enum Value {
     Integer(i64),

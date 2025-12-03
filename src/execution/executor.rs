@@ -27,8 +27,8 @@ impl Executor {
             PhysicalPlan::CreateTable { name, columns } => {
                 self.execute_create_table(name, columns, storage, catalog)
             }
-            PhysicalPlan::Select { table, columns, filter, limit } => {
-                self.execute_select(table, columns, filter, limit, storage, catalog)
+            PhysicalPlan::Select { table, columns, filter, group_by, limit } => {
+                self.execute_select(table, columns, filter, group_by, limit, storage, catalog)
             }
             PhysicalPlan::Insert { table, columns, values } => {
                 self.execute_insert(table, columns, values, storage, catalog)
@@ -67,6 +67,7 @@ impl Executor {
         table: &str,
         columns: &[crate::parser::ast::SelectItem],
         filter: &Option<crate::parser::ast::Expr>,
+        group_by: &Option<Vec<String>>,
         limit: &Option<u64>,
         storage: &StorageEngine,
         catalog: &Catalog,
@@ -87,6 +88,22 @@ impl Executor {
         } else {
             all_rows
         };
+
+        // Check if we have aggregate functions
+        let has_aggregates = columns.iter().any(|item| {
+            matches!(item, crate::parser::ast::SelectItem::FunctionCall { .. })
+        });
+
+        // If we have aggregates, perform aggregation
+        if has_aggregates {
+            return self.execute_aggregation(
+                table_schema,
+                &filtered_rows,
+                columns,
+                group_by,
+                limit,
+            );
+        }
 
         // Apply LIMIT (Snowflake LIMIT behavior: limit the number of rows returned)
         let limited_rows = if let Some(limit_value) = limit {
@@ -124,6 +141,9 @@ impl Executor {
                         // Shouldn't happen if we're in this branch
                         return Err(anyhow!("Unexpected SELECT *"));
                     }
+                    crate::parser::ast::SelectItem::FunctionCall { .. } => {
+                        return Err(anyhow!("Function calls should be handled by aggregation"));
+                    }
                 }
             }
 
@@ -152,6 +172,127 @@ impl Executor {
 
         Ok(QueryResult {
             rows: result_rows,
+            columns: result_columns,
+        })
+    }
+
+    fn execute_aggregation(
+        &self,
+        table_schema: &crate::catalog::schema::Table,
+        filtered_rows: &[Vec<Value>],
+        columns: &[crate::parser::ast::SelectItem],
+        group_by: &Option<Vec<String>>,
+        limit: &Option<u64>,
+    ) -> Result<QueryResult> {
+        use std::collections::HashMap;
+
+        // Group rows by GROUP BY columns
+        let mut groups: HashMap<Vec<Value>, Vec<&Vec<Value>>> = HashMap::new();
+
+        if let Some(group_by_cols) = group_by {
+            // Get column indices for GROUP BY columns
+            let mut group_by_indices = Vec::new();
+            for col_name in group_by_cols {
+                let col = table_schema.get_column(col_name).ok_or_else(|| {
+                    anyhow!("GROUP BY column '{}' not found", col_name)
+                })?;
+                group_by_indices.push(col.ordinal);
+            }
+
+            // Group rows
+            for row in filtered_rows {
+                let group_key: Vec<Value> = group_by_indices.iter().map(|&idx| row[idx].clone()).collect();
+                groups.entry(group_key).or_insert_with(Vec::new).push(row);
+            }
+        } else {
+            // No GROUP BY - single group with all rows (even if empty)
+            // For empty tables, we still need to return one row with aggregate results
+            let group_rows: Vec<&Vec<Value>> = filtered_rows.iter().collect();
+            groups.insert(Vec::new(), group_rows);
+        }
+        
+        // Ensure we have at least one group if no GROUP BY (for empty tables)
+        // This handles the case where filtered_rows is empty
+        if group_by.is_none() {
+            groups.entry(Vec::new()).or_insert_with(Vec::new);
+        }
+
+        // Build column name list
+        let mut result_columns = Vec::new();
+        for item in columns {
+            match item {
+                crate::parser::ast::SelectItem::Column(col_name) => {
+                    result_columns.push(col_name.clone());
+                }
+                crate::parser::ast::SelectItem::FunctionCall { name, .. } => {
+                    result_columns.push(name.clone());
+                }
+                crate::parser::ast::SelectItem::All => {
+                    return Err(anyhow!("SELECT * not allowed with aggregate functions"));
+                }
+            }
+        }
+
+        // Get GROUP BY column indices if present
+        let group_by_indices = if let Some(group_by_cols) = group_by {
+            Some(
+                group_by_cols
+                    .iter()
+                    .map(|col_name| {
+                        let col = table_schema.get_column(col_name).ok_or_else(|| {
+                            anyhow!("GROUP BY column '{}' not found", col_name)
+                        })?;
+                        Ok(col.ordinal)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+
+        // Compute aggregates for each group
+        let mut result_rows = Vec::new();
+
+        for (group_key, group_rows) in &groups {
+            let mut result_row = Vec::new();
+
+            for item in columns {
+                match item {
+                    crate::parser::ast::SelectItem::Column(col_name) => {
+                        // GROUP BY column - get value from group_key
+                        if let Some(ref group_by_cols) = group_by {
+                            if let Some(idx) = group_by_cols.iter().position(|c| c == col_name) {
+                                result_row.push(group_key[idx].clone());
+                            } else {
+                                return Err(anyhow!("Column '{}' must be in GROUP BY", col_name));
+                            }
+                        } else {
+                            return Err(anyhow!("Column '{}' must be in GROUP BY", col_name));
+                        }
+                    }
+                    crate::parser::ast::SelectItem::FunctionCall { name: _, function } => {
+                        let agg_value = compute_aggregate(function, group_rows, table_schema)?;
+                        result_row.push(agg_value);
+                    }
+                    crate::parser::ast::SelectItem::All => {
+                        return Err(anyhow!("SELECT * not allowed with aggregate functions"));
+                    }
+                }
+            }
+
+            result_rows.push(result_row);
+        }
+
+        // Apply LIMIT after aggregation
+        let limited_rows = if let Some(limit_value) = limit {
+            let limit_usize = *limit_value as usize;
+            result_rows.into_iter().take(limit_usize).collect()
+        } else {
+            result_rows
+        };
+
+        Ok(QueryResult {
+            rows: limited_rows,
             columns: result_columns,
         })
     }
@@ -333,5 +474,185 @@ fn evaluate_binary_op(
     // For now, binary ops in expressions are mainly for comparisons in WHERE clauses
     // Arithmetic operations would go here if needed
     Err(anyhow!("Binary operations in expressions not yet supported"))
+}
+
+/// Compute aggregate function value for a group of rows
+fn compute_aggregate(
+    function: &crate::parser::ast::AggregateFunction,
+    rows: &[&Vec<Value>],
+    table_schema: &crate::catalog::schema::Table,
+) -> Result<Value> {
+    use std::collections::HashSet;
+
+    match function {
+        crate::parser::ast::AggregateFunction::Count { distinct, expr } => {
+            if expr.is_none() {
+                // COUNT(*) - count all rows
+                Ok(Value::Integer(rows.len() as i64))
+            } else {
+                // COUNT(column) or COUNT(DISTINCT column)
+                let expr = expr.as_ref().unwrap();
+                let mut values = Vec::new();
+
+                for row in rows {
+                    match evaluate_expr(expr, row, table_schema) {
+                        Ok(val) if val != Value::Null => {
+                            values.push(val);
+                        }
+                        _ => {
+                            // Skip NULL values
+                        }
+                    }
+                }
+
+                if *distinct {
+                    // COUNT(DISTINCT column)
+                    let distinct_count = values.iter().collect::<HashSet<_>>().len();
+                    Ok(Value::Integer(distinct_count as i64))
+                } else {
+                    // COUNT(column)
+                    Ok(Value::Integer(values.len() as i64))
+                }
+            }
+        }
+        crate::parser::ast::AggregateFunction::Sum { distinct, expr } => {
+            let mut values = Vec::new();
+
+            for row in rows {
+                match evaluate_expr(expr, row, table_schema) {
+                    Ok(val) if val != Value::Null => {
+                        values.push(val);
+                    }
+                    _ => {
+                        // Skip NULL values
+                    }
+                }
+            }
+
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            if *distinct {
+                // SUM(DISTINCT column)
+                let distinct_values: HashSet<Value> = values.iter().cloned().collect();
+                let sum: Result<i64> = distinct_values
+                    .iter()
+                    .map(|v| {
+                        match v {
+                            Value::Integer(i) => Ok(*i),
+                            _ => Err(anyhow!("SUM only works on numeric types")),
+                        }
+                    })
+                    .sum();
+                Ok(Value::Integer(sum?))
+            } else {
+                // SUM(column)
+                let sum: Result<i64> = values
+                    .iter()
+                    .map(|v| {
+                        match v {
+                            Value::Integer(i) => Ok(*i),
+                            _ => Err(anyhow!("SUM only works on numeric types")),
+                        }
+                    })
+                    .sum();
+                Ok(Value::Integer(sum?))
+            }
+        }
+        crate::parser::ast::AggregateFunction::Avg { distinct, expr } => {
+            let mut values = Vec::new();
+
+            for row in rows {
+                match evaluate_expr(expr, row, table_schema) {
+                    Ok(val) if val != Value::Null => {
+                        values.push(val);
+                    }
+                    _ => {
+                        // Skip NULL values
+                    }
+                }
+            }
+
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            if *distinct {
+                // AVG(DISTINCT column)
+                let distinct_values: HashSet<Value> = values.iter().cloned().collect();
+                let sum: Result<i64> = distinct_values
+                    .iter()
+                    .map(|v| {
+                        match v {
+                            Value::Integer(i) => Ok(*i),
+                            _ => Err(anyhow!("AVG only works on numeric types")),
+                        }
+                    })
+                    .sum();
+                let count = distinct_values.len() as i64;
+                Ok(Value::Integer(sum? / count))
+            } else {
+                // AVG(column)
+                let sum: Result<i64> = values
+                    .iter()
+                    .map(|v| {
+                        match v {
+                            Value::Integer(i) => Ok(*i),
+                            _ => Err(anyhow!("AVG only works on numeric types")),
+                        }
+                    })
+                    .sum();
+                let count = values.len() as i64;
+                Ok(Value::Integer(sum? / count))
+            }
+        }
+        crate::parser::ast::AggregateFunction::Min { expr } => {
+            let mut min_val: Option<Value> = None;
+
+            for row in rows {
+                match evaluate_expr(expr, row, table_schema) {
+                    Ok(val) if val != Value::Null => {
+                        if let Some(ref current_min) = min_val {
+                            if compare_values(&val, current_min)? == std::cmp::Ordering::Less {
+                                min_val = Some(val);
+                            }
+                        } else {
+                            min_val = Some(val);
+                        }
+                    }
+                    _ => {
+                        // Skip NULL values
+                    }
+                }
+            }
+
+            // Return NULL if all values were NULL (Snowflake behavior)
+            Ok(min_val.unwrap_or(Value::Null))
+        }
+        crate::parser::ast::AggregateFunction::Max { expr } => {
+            let mut max_val: Option<Value> = None;
+
+            for row in rows {
+                match evaluate_expr(expr, row, table_schema) {
+                    Ok(val) if val != Value::Null => {
+                        if let Some(ref current_max) = max_val {
+                            if compare_values(&val, current_max)? == std::cmp::Ordering::Greater {
+                                max_val = Some(val);
+                            }
+                        } else {
+                            max_val = Some(val);
+                        }
+                    }
+                    _ => {
+                        // Skip NULL values
+                    }
+                }
+            }
+
+            // Return NULL if all values were NULL (Snowflake behavior)
+            Ok(max_val.unwrap_or(Value::Null))
+        }
+    }
 }
 

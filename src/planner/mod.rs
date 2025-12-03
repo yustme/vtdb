@@ -51,12 +51,59 @@ impl Planner {
         })?.name.clone();
 
         // Verify table exists
-        catalog.get_table(&table_name)?;
+        let table_schema = catalog.get_table(&table_name)?;
+
+        // Check if we have aggregate functions
+        let has_aggregates = select.columns.iter().any(|item| {
+            matches!(item, SelectItem::FunctionCall { .. })
+        });
+
+        // If we have GROUP BY, validate that non-aggregate columns are in GROUP BY
+        if let Some(group_by) = &select.group_by {
+            for item in &select.columns {
+                match item {
+                    SelectItem::Column(col_name) => {
+                        if !group_by.contains(col_name) {
+                            return Err(anyhow!(
+                                "Column '{}' must appear in GROUP BY clause or be used in an aggregate function",
+                                col_name
+                            ));
+                        }
+                    }
+                    SelectItem::All => {
+                        if has_aggregates {
+                            return Err(anyhow!("Cannot use SELECT * with aggregate functions and GROUP BY"));
+                        }
+                    }
+                    SelectItem::FunctionCall { .. } => {
+                        // Aggregate functions are allowed
+                    }
+                }
+            }
+        } else if has_aggregates {
+            // If we have aggregates but no GROUP BY, all non-aggregate columns must be constants or invalid
+            for item in &select.columns {
+                match item {
+                    SelectItem::Column(_) => {
+                        return Err(anyhow!(
+                            "Column must appear in GROUP BY clause or be used in an aggregate function"
+                        ));
+                    }
+                    SelectItem::All => {
+                        return Err(anyhow!("Cannot use SELECT * with aggregate functions"));
+                    }
+                    SelectItem::FunctionCall { .. } => {
+                        // Aggregate functions are allowed
+                    }
+                }
+            }
+        }
 
         Ok(PhysicalPlan::Select {
             table: table_name,
             columns: select.columns.clone(),
             filter: select.where_clause.clone(),
+            group_by: select.group_by.clone(),
             limit: select.limit,
         })
     }

@@ -53,6 +53,14 @@ impl Catalog {
             .map(|s| s.has_table(name))
             .unwrap_or(false)
     }
+
+    /// List all tables in the PUBLIC schema
+    pub fn list_tables(&self) -> Vec<String> {
+        self.schemas
+            .get("PUBLIC")
+            .map(|s| s.list_tables())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for Catalog {
