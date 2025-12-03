@@ -25,6 +25,13 @@ struct ColumnInfo {
     ordinal: usize,      // Position in combined row
 }
 
+/// Join key information for hash joins
+#[derive(Clone)]
+struct JoinKeyInfo {
+    left_indices: Vec<usize>,
+    right_indices: Vec<usize>,
+}
+
 impl CombinedSchema {
     fn from_single_table(
         schema: &crate::catalog::schema::Table,
@@ -769,11 +776,20 @@ impl Executor {
         left_schema: &CombinedSchema,
         right_schema: &CombinedSchema,
     ) -> Result<Vec<Vec<Value>>> {
-        let mut result = Vec::new();
-        
         match condition {
             Some(crate::parser::ast::JoinCondition::On(expr)) => {
-                // ON condition - evaluate for each row pair
+                // Try hash join for equi-joins
+                if let Some(key_info) = self.extract_equi_join_keys(expr, left_schema, right_schema) {
+                    // Use hash join for equi-join
+                    return Ok(self.hash_join_equi(left_rows, right_rows, &key_info));
+                }
+                
+                // Fall back to nested loop for complex conditions
+                let mut result = Vec::new();
+                // Pre-allocate with estimated capacity
+                let estimated_size = left_rows.len().min(right_rows.len());
+                result.reserve(estimated_size);
+                
                 for left_row in left_rows {
                     for right_row in right_rows {
                         let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
@@ -782,49 +798,66 @@ impl Executor {
                         }
                     }
                 }
+                Ok(result)
             }
             Some(crate::parser::ast::JoinCondition::Using(columns)) => {
-                // USING clause - equi-join on specified columns
-                for left_row in left_rows {
-                    for right_row in right_rows {
-                        let mut matches = true;
-                        for col_name in columns {
-                            let left_idx = left_schema.find_column(None, col_name)?;
-                            let right_idx = right_schema.find_column(None, col_name)?;
-                            if left_row[left_idx] != right_row[right_idx] {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        if matches {
-                            let mut combined = left_row.clone();
-                            // Add right columns, skipping USING columns
-                            let mut right_indices: Vec<usize> = (0..right_row.len()).collect();
-                            for col_name in columns {
-                                if let Ok(idx) = right_schema.find_column(None, col_name) {
-                                    right_indices.retain(|&i| i != idx);
-                                }
-                            }
-                            for &idx in &right_indices {
-                                combined.push(right_row[idx].clone());
-                            }
-                            result.push(combined);
-                        }
+                // USING clause - equi-join, use hash join
+                // Pre-compute column indices
+                let mut left_indices = Vec::new();
+                let mut right_indices = Vec::new();
+                for col_name in columns {
+                    left_indices.push(left_schema.find_column(None, col_name)?);
+                    right_indices.push(right_schema.find_column(None, col_name)?);
+                }
+                
+                let key_info = JoinKeyInfo {
+                    left_indices,
+                    right_indices,
+                };
+                
+                let mut result = self.hash_join_equi(left_rows, right_rows, &key_info);
+                
+                // For USING, we need to deduplicate columns - only include USING columns once
+                // Pre-compute which right columns to skip
+                let mut right_skip_indices = std::collections::HashSet::new();
+                for col_name in columns {
+                    if let Ok(idx) = right_schema.find_column(None, col_name) {
+                        right_skip_indices.insert(idx);
                     }
                 }
+                
+                // Rebuild result rows with deduplicated columns
+                let mut deduplicated_result = Vec::new();
+                for row in result {
+                    let left_col_count = left_rows.first().map(|r| r.len()).unwrap_or(0);
+                    let mut new_row = Vec::with_capacity(left_col_count + right_rows.first().map(|r| r.len() - right_skip_indices.len()).unwrap_or(0));
+                    
+                    // Add all left columns
+                    new_row.extend_from_slice(&row[..left_col_count]);
+                    
+                    // Add right columns, skipping USING columns
+                    for (idx, val) in row[left_col_count..].iter().enumerate() {
+                        if !right_skip_indices.contains(&idx) {
+                            new_row.push(val.clone());
+                        }
+                    }
+                    deduplicated_result.push(new_row);
+                }
+                
+                Ok(deduplicated_result)
             }
             None => {
                 // No condition - cartesian product (shouldn't happen for INNER JOIN, but handle it)
+                let mut result = Vec::with_capacity(left_rows.len() * right_rows.len());
                 for left_row in left_rows {
                     for right_row in right_rows {
                         let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
                         result.push(combined_row);
                     }
                 }
+                Ok(result)
             }
         }
-        
-        Ok(result)
     }
 
     /// LEFT JOIN implementation
@@ -836,71 +869,119 @@ impl Executor {
         left_schema: &CombinedSchema,
         right_schema: &CombinedSchema,
     ) -> Result<Vec<Vec<Value>>> {
-        let mut result = Vec::new();
+        use std::collections::HashSet;
+        
         let right_null_row: Vec<Value> = vec![Value::Null; right_schema.columns.len()];
+        let mut result = Vec::new();
+        let mut matched_left_indices = HashSet::new();
         
         match condition {
             Some(crate::parser::ast::JoinCondition::On(expr)) => {
-                for left_row in left_rows {
-                    let mut matched = false;
-                    for right_row in right_rows {
-                        let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
-                        if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
-                            result.push(combined_row);
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        // No match - add left row with NULLs for right
-                        let mut combined = left_row.clone();
-                        combined.extend(right_null_row.clone());
-                        result.push(combined);
-                    }
-                }
-            }
-            Some(crate::parser::ast::JoinCondition::Using(columns)) => {
-                for left_row in left_rows {
-                    let mut matched = false;
-                    for right_row in right_rows {
-                        let mut matches = true;
-                        for col_name in columns {
-                            let left_idx = left_schema.find_column(None, col_name)?;
-                            let right_idx = right_schema.find_column(None, col_name)?;
-                            if left_row[left_idx] != right_row[right_idx] {
-                                matches = false;
-                                break;
+                // Try hash join for equi-joins
+                if let Some(key_info) = self.extract_equi_join_keys(expr, left_schema, right_schema) {
+                    // Use hash join for equi-join
+                    // Build hash table on right (probe side)
+                    let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                    
+                    // Probe with left rows
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        let left_key: Vec<Value> = key_info.left_indices.iter().map(|&idx| left_row[idx].clone()).collect();
+                        
+                        if let Some(right_indices) = hash_table.get(&left_key) {
+                            matched_left_indices.insert(left_idx);
+                            for &right_idx in right_indices {
+                                let right_row = &right_rows[right_idx];
+                                let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                                result.push(combined_row);
                             }
                         }
-                        if matches {
-                            matched = true;
+                    }
+                } else {
+                    // Fall back to nested loop for complex conditions
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        let mut matched = false;
+                        for right_row in right_rows {
+                            let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                            if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
+                                matched_left_indices.insert(left_idx);
+                                result.push(combined_row);
+                                matched = true;
+                            }
+                        }
+                        if !matched {
                             let mut combined = left_row.clone();
-                            let mut right_indices: Vec<usize> = (0..right_row.len()).collect();
-                            for col_name in columns {
-                                if let Ok(idx) = right_schema.find_column(None, col_name) {
-                                    right_indices.retain(|&i| i != idx);
-                                }
-                            }
-                            for &idx in &right_indices {
-                                combined.push(right_row[idx].clone());
-                            }
+                            combined.extend(right_null_row.clone());
                             result.push(combined);
                         }
                     }
-                    if !matched {
-                        let mut combined = left_row.clone();
-                        combined.extend(right_null_row.clone());
-                        result.push(combined);
+                    return Ok(result);
+                }
+            }
+            Some(crate::parser::ast::JoinCondition::Using(columns)) => {
+                // USING clause - equi-join, use hash join
+                // Pre-compute column indices
+                let mut left_indices = Vec::new();
+                let mut right_indices = Vec::new();
+                for col_name in columns {
+                    left_indices.push(left_schema.find_column(None, col_name)?);
+                    right_indices.push(right_schema.find_column(None, col_name)?);
+                }
+                
+                let key_info = JoinKeyInfo {
+                    left_indices,
+                    right_indices,
+                };
+                
+                // Build hash table on right
+                let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                
+                // Pre-compute which right columns to skip for USING
+                let mut right_skip_indices = std::collections::HashSet::new();
+                for col_name in columns {
+                    if let Ok(idx) = right_schema.find_column(None, col_name) {
+                        right_skip_indices.insert(idx);
+                    }
+                }
+                
+                // Probe with left rows
+                for (left_idx, left_row) in left_rows.iter().enumerate() {
+                    let left_key: Vec<Value> = key_info.left_indices.iter().map(|&idx| left_row[idx].clone()).collect();
+                    
+                    if let Some(right_row_indices) = hash_table.get(&left_key) {
+                        matched_left_indices.insert(left_idx);
+                        for &right_idx in right_row_indices {
+                            let right_row = &right_rows[right_idx];
+                            let mut combined = left_row.clone();
+                            // Add right columns, skipping USING columns
+                            for (idx, val) in right_row.iter().enumerate() {
+                                if !right_skip_indices.contains(&idx) {
+                                    combined.push(val.clone());
+                                }
+                            }
+                            result.push(combined);
+                        }
                     }
                 }
             }
             None => {
                 // CROSS JOIN behavior
+                let mut result = Vec::with_capacity(left_rows.len() * right_rows.len());
                 for left_row in left_rows {
                     for right_row in right_rows {
                         let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
                         result.push(combined_row);
                     }
                 }
+                return Ok(result);
+            }
+        }
+        
+        // Add unmatched left rows with NULLs for right
+        for (left_idx, left_row) in left_rows.iter().enumerate() {
+            if !matched_left_indices.contains(&left_idx) {
+                let mut combined = left_row.clone();
+                combined.extend(right_null_row.clone());
+                result.push(combined);
             }
         }
         
@@ -916,71 +997,119 @@ impl Executor {
         left_schema: &CombinedSchema,
         right_schema: &CombinedSchema,
     ) -> Result<Vec<Vec<Value>>> {
-        let mut result = Vec::new();
+        use std::collections::HashSet;
+        
         let left_null_row: Vec<Value> = vec![Value::Null; left_schema.columns.len()];
+        let mut result = Vec::new();
+        let mut matched_right_indices = HashSet::new();
         
         match condition {
             Some(crate::parser::ast::JoinCondition::On(expr)) => {
-                for right_row in right_rows {
-                    let mut matched = false;
-                    for left_row in left_rows {
-                        let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
-                        if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
-                            result.push(combined_row);
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        // No match - add NULLs for left, then right row
-                        let mut combined = left_null_row.clone();
-                        combined.extend(right_row.clone());
-                        result.push(combined);
-                    }
-                }
-            }
-            Some(crate::parser::ast::JoinCondition::Using(columns)) => {
-                for right_row in right_rows {
-                    let mut matched = false;
-                    for left_row in left_rows {
-                        let mut matches = true;
-                        for col_name in columns {
-                            let left_idx = left_schema.find_column(None, col_name)?;
-                            let right_idx = right_schema.find_column(None, col_name)?;
-                            if left_row[left_idx] != right_row[right_idx] {
-                                matches = false;
-                                break;
+                // Try hash join for equi-joins
+                if let Some(key_info) = self.extract_equi_join_keys(expr, left_schema, right_schema) {
+                    // Use hash join for equi-join
+                    // Build hash table on left (probe side)
+                    let hash_table = self.build_hash_table(left_rows, &key_info.left_indices);
+                    
+                    // Probe with right rows
+                    for (right_idx, right_row) in right_rows.iter().enumerate() {
+                        let right_key: Vec<Value> = key_info.right_indices.iter().map(|&idx| right_row[idx].clone()).collect();
+                        
+                        if let Some(left_indices) = hash_table.get(&right_key) {
+                            matched_right_indices.insert(right_idx);
+                            for &left_idx in left_indices {
+                                let left_row = &left_rows[left_idx];
+                                let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                                result.push(combined_row);
                             }
                         }
-                        if matches {
-                            matched = true;
-                            let mut combined = left_row.clone();
-                            let mut right_indices: Vec<usize> = (0..right_row.len()).collect();
-                            for col_name in columns {
-                                if let Ok(idx) = right_schema.find_column(None, col_name) {
-                                    right_indices.retain(|&i| i != idx);
-                                }
+                    }
+                } else {
+                    // Fall back to nested loop for complex conditions
+                    for (right_idx, right_row) in right_rows.iter().enumerate() {
+                        let mut matched = false;
+                        for left_row in left_rows {
+                            let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                            if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
+                                matched_right_indices.insert(right_idx);
+                                result.push(combined_row);
+                                matched = true;
                             }
-                            for &idx in &right_indices {
-                                combined.push(right_row[idx].clone());
-                            }
+                        }
+                        if !matched {
+                            let mut combined = left_null_row.clone();
+                            combined.extend(right_row.clone());
                             result.push(combined);
                         }
                     }
-                    if !matched {
-                        let mut combined = left_null_row.clone();
-                        combined.extend(right_row.clone());
-                        result.push(combined);
+                    return Ok(result);
+                }
+            }
+            Some(crate::parser::ast::JoinCondition::Using(columns)) => {
+                // USING clause - equi-join, use hash join
+                // Pre-compute column indices
+                let mut left_indices = Vec::new();
+                let mut right_indices = Vec::new();
+                for col_name in columns {
+                    left_indices.push(left_schema.find_column(None, col_name)?);
+                    right_indices.push(right_schema.find_column(None, col_name)?);
+                }
+                
+                let key_info = JoinKeyInfo {
+                    left_indices,
+                    right_indices,
+                };
+                
+                // Build hash table on left
+                let hash_table = self.build_hash_table(left_rows, &key_info.left_indices);
+                
+                // Pre-compute which right columns to skip for USING
+                let mut right_skip_indices = std::collections::HashSet::new();
+                for col_name in columns {
+                    if let Ok(idx) = right_schema.find_column(None, col_name) {
+                        right_skip_indices.insert(idx);
+                    }
+                }
+                
+                // Probe with right rows
+                for (right_idx, right_row) in right_rows.iter().enumerate() {
+                    let right_key: Vec<Value> = key_info.right_indices.iter().map(|&idx| right_row[idx].clone()).collect();
+                    
+                    if let Some(left_row_indices) = hash_table.get(&right_key) {
+                        matched_right_indices.insert(right_idx);
+                        for &left_idx in left_row_indices {
+                            let left_row = &left_rows[left_idx];
+                            let mut combined = left_row.clone();
+                            // Add right columns, skipping USING columns
+                            for (idx, val) in right_row.iter().enumerate() {
+                                if !right_skip_indices.contains(&idx) {
+                                    combined.push(val.clone());
+                                }
+                            }
+                            result.push(combined);
+                        }
                     }
                 }
             }
             None => {
                 // CROSS JOIN behavior
+                let mut result = Vec::with_capacity(left_rows.len() * right_rows.len());
                 for left_row in left_rows {
                     for right_row in right_rows {
                         let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
                         result.push(combined_row);
                     }
                 }
+                return Ok(result);
+            }
+        }
+        
+        // Add unmatched right rows with NULLs for left
+        for (right_idx, right_row) in right_rows.iter().enumerate() {
+            if !matched_right_indices.contains(&right_idx) {
+                let mut combined = left_null_row.clone();
+                combined.extend(right_row.clone());
+                result.push(combined);
             }
         }
         
@@ -1006,82 +1135,84 @@ impl Executor {
         
         match condition {
             Some(crate::parser::ast::JoinCondition::On(expr)) => {
-                // Find all matches
-                for (left_idx, left_row) in left_rows.iter().enumerate() {
-                    for (right_idx, right_row) in right_rows.iter().enumerate() {
-                        let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
-                        if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
-                            result.push(combined_row);
+                // Try hash join for equi-joins
+                if let Some(key_info) = self.extract_equi_join_keys(expr, left_schema, right_schema) {
+                    // Use hash join for equi-join
+                    // Build hash table on right (smaller table)
+                    let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                    
+                    // Probe with left rows
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        let left_key: Vec<Value> = key_info.left_indices.iter().map(|&idx| left_row[idx].clone()).collect();
+                        
+                        if let Some(right_indices) = hash_table.get(&left_key) {
                             matched_left_indices.insert(left_idx);
-                            matched_right_indices.insert(right_idx);
+                            for &right_idx in right_indices {
+                                matched_right_indices.insert(right_idx);
+                                let right_row = &right_rows[right_idx];
+                                let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                                result.push(combined_row);
+                            }
                         }
                     }
-                }
-                
-                // Add unmatched left rows
-                for (idx, left_row) in left_rows.iter().enumerate() {
-                    if !matched_left_indices.contains(&idx) {
-                        let mut combined = left_row.clone();
-                        combined.extend(right_null_row.clone());
-                        result.push(combined);
-                    }
-                }
-                
-                // Add unmatched right rows
-                for (idx, right_row) in right_rows.iter().enumerate() {
-                    if !matched_right_indices.contains(&idx) {
-                        let mut combined = left_null_row.clone();
-                        combined.extend(right_row.clone());
-                        result.push(combined);
+                } else {
+                    // Fall back to nested loop for complex conditions
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        for (right_idx, right_row) in right_rows.iter().enumerate() {
+                            let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                            if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
+                                matched_left_indices.insert(left_idx);
+                                matched_right_indices.insert(right_idx);
+                                result.push(combined_row);
+                            }
+                        }
                     }
                 }
             }
             Some(crate::parser::ast::JoinCondition::Using(columns)) => {
-                // Find all matches
+                // USING clause - equi-join, use hash join
+                // Pre-compute column indices
+                let mut left_indices = Vec::new();
+                let mut right_indices = Vec::new();
+                for col_name in columns {
+                    left_indices.push(left_schema.find_column(None, col_name)?);
+                    right_indices.push(right_schema.find_column(None, col_name)?);
+                }
+                
+                let key_info = JoinKeyInfo {
+                    left_indices,
+                    right_indices,
+                };
+                
+                // Build hash table on right
+                let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                
+                // Pre-compute which right columns to skip for USING
+                let mut right_skip_indices = std::collections::HashSet::new();
+                for col_name in columns {
+                    if let Ok(idx) = right_schema.find_column(None, col_name) {
+                        right_skip_indices.insert(idx);
+                    }
+                }
+                
+                // Probe with left rows
                 for (left_idx, left_row) in left_rows.iter().enumerate() {
-                    for (right_idx, right_row) in right_rows.iter().enumerate() {
-                        let mut matches = true;
-                        for col_name in columns {
-                            let left_col_idx = left_schema.find_column(None, col_name)?;
-                            let right_col_idx = right_schema.find_column(None, col_name)?;
-                            if left_row[left_col_idx] != right_row[right_col_idx] {
-                                matches = false;
-                                break;
-                            }
-                        }
-                        if matches {
-                            matched_left_indices.insert(left_idx);
+                    let left_key: Vec<Value> = key_info.left_indices.iter().map(|&idx| left_row[idx].clone()).collect();
+                    
+                    if let Some(right_row_indices) = hash_table.get(&left_key) {
+                        matched_left_indices.insert(left_idx);
+                        for &right_idx in right_row_indices {
                             matched_right_indices.insert(right_idx);
+                            let right_row = &right_rows[right_idx];
                             let mut combined = left_row.clone();
-                            let mut right_indices: Vec<usize> = (0..right_row.len()).collect();
-                            for col_name in columns {
-                                if let Ok(idx) = right_schema.find_column(None, col_name) {
-                                    right_indices.retain(|&i| i != idx);
+                            // Add right columns, skipping USING columns
+                            for (idx, val) in right_row.iter().enumerate() {
+                                if !right_skip_indices.contains(&idx) {
+                                    combined.push(val.clone());
                                 }
-                            }
-                            for &idx in &right_indices {
-                                combined.push(right_row[idx].clone());
                             }
                             result.push(combined);
                         }
-                    }
-                }
-                
-                // Add unmatched left rows
-                for (idx, left_row) in left_rows.iter().enumerate() {
-                    if !matched_left_indices.contains(&idx) {
-                        let mut combined = left_row.clone();
-                        combined.extend(right_null_row.clone());
-                        result.push(combined);
-                    }
-                }
-                
-                // Add unmatched right rows
-                for (idx, right_row) in right_rows.iter().enumerate() {
-                    if !matched_right_indices.contains(&idx) {
-                        let mut combined = left_null_row.clone();
-                        combined.extend(right_row.clone());
-                        result.push(combined);
                     }
                 }
             }
@@ -1113,6 +1244,173 @@ impl Executor {
             }
         }
         Ok(result)
+    }
+
+    /// Extract equi-join keys from ON condition (e.g., left.id = right.user_id)
+    /// Returns Some(JoinKeyInfo) if it's a simple equi-join, None otherwise
+    fn extract_equi_join_keys(
+        &self,
+        expr: &crate::parser::ast::Expr,
+        left_schema: &CombinedSchema,
+        right_schema: &CombinedSchema,
+    ) -> Option<JoinKeyInfo> {
+        match expr {
+            crate::parser::ast::Expr::BinaryOp { left, op, right } => {
+                if *op != crate::parser::ast::BinaryOperator::Eq {
+                    return None;
+                }
+                
+                // Check if it's a simple column = column comparison
+                let (left_col, right_col) = match (left.as_ref(), right.as_ref()) {
+                    (
+                        crate::parser::ast::Expr::Column(left_col),
+                        crate::parser::ast::Expr::Column(right_col),
+                    ) => (left_col, right_col),
+                    (
+                        crate::parser::ast::Expr::QualifiedColumn { table: left_table, column: left_col },
+                        crate::parser::ast::Expr::QualifiedColumn { table: right_table, column: right_col },
+                    ) => {
+                        // Check if one is from left table and one from right
+                        let left_in_left = left_schema.find_column(Some(left_table), left_col).is_ok();
+                        let right_in_right = right_schema.find_column(Some(right_table), right_col).is_ok();
+                        let left_in_right = right_schema.find_column(Some(left_table), left_col).is_ok();
+                        let right_in_left = left_schema.find_column(Some(right_table), right_col).is_ok();
+                        
+                        if (left_in_left && right_in_right) || (left_in_right && right_in_left) {
+                            // Determine which is which
+                            if left_in_left && right_in_right {
+                                (left_col, right_col)
+                            } else {
+                                (right_col, left_col)
+                            }
+                        } else {
+                            return None;
+                        }
+                    }
+                    (
+                        crate::parser::ast::Expr::QualifiedColumn { table, column },
+                        crate::parser::ast::Expr::Column(col),
+                    ) => {
+                        // Check if qualified is from left and unqualified from right, or vice versa
+                        let qualified_in_left = left_schema.find_column(Some(table), column).is_ok();
+                        let qualified_in_right = right_schema.find_column(Some(table), column).is_ok();
+                        let unqualified_in_left = left_schema.find_column(None, col).is_ok();
+                        let unqualified_in_right = right_schema.find_column(None, col).is_ok();
+                        
+                        if qualified_in_left && unqualified_in_right {
+                            (column, col)
+                        } else if qualified_in_right && unqualified_in_left {
+                            (col, column)
+                        } else {
+                            return None;
+                        }
+                    }
+                    (
+                        crate::parser::ast::Expr::Column(col),
+                        crate::parser::ast::Expr::QualifiedColumn { table, column },
+                    ) => {
+                        let qualified_in_left = left_schema.find_column(Some(table), column).is_ok();
+                        let qualified_in_right = right_schema.find_column(Some(table), column).is_ok();
+                        let unqualified_in_left = left_schema.find_column(None, col).is_ok();
+                        let unqualified_in_right = right_schema.find_column(None, col).is_ok();
+                        
+                        if unqualified_in_left && qualified_in_right {
+                            (col, column)
+                        } else if unqualified_in_right && qualified_in_left {
+                            (column, col)
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                };
+                
+                // Get column indices
+                let left_idx = left_schema.find_column(None, left_col).ok()?;
+                let right_idx = right_schema.find_column(None, right_col).ok()?;
+                
+                Some(JoinKeyInfo {
+                    left_indices: vec![left_idx],
+                    right_indices: vec![right_idx],
+                })
+            }
+            crate::parser::ast::Expr::BinaryOp { left, op, right } if *op == crate::parser::ast::BinaryOperator::And => {
+                // Handle AND of multiple equi-joins (multi-column join keys)
+                let left_keys = self.extract_equi_join_keys(left, left_schema, right_schema)?;
+                let right_keys = self.extract_equi_join_keys(right, left_schema, right_schema)?;
+                
+                Some(JoinKeyInfo {
+                    left_indices: {
+                        let mut v = left_keys.left_indices;
+                        v.extend(right_keys.left_indices);
+                        v
+                    },
+                    right_indices: {
+                        let mut v = left_keys.right_indices;
+                        v.extend(right_keys.right_indices);
+                        v
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Build hash table from rows using specified key indices
+    fn build_hash_table(
+        &self,
+        rows: &[Vec<Value>],
+        key_indices: &[usize],
+    ) -> std::collections::HashMap<Vec<Value>, Vec<usize>> {
+        use std::collections::HashMap;
+        let mut hash_table: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+        
+        for (row_idx, row) in rows.iter().enumerate() {
+            let key: Vec<Value> = key_indices.iter().map(|&idx| row[idx].clone()).collect();
+            hash_table.entry(key).or_insert_with(Vec::new).push(row_idx);
+        }
+        
+        hash_table
+    }
+
+    /// Hash join for equi-joins
+    /// Returns joined rows using hash join algorithm
+    fn hash_join_equi(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_rows: &[Vec<Value>],
+        key_info: &JoinKeyInfo,
+    ) -> Vec<Vec<Value>> {
+        // Choose build side (smaller table) and probe side (larger table)
+        let (build_rows, probe_rows, build_indices, probe_indices) = if left_rows.len() <= right_rows.len() {
+            (left_rows, right_rows, &key_info.left_indices, &key_info.right_indices)
+        } else {
+            (right_rows, left_rows, &key_info.right_indices, &key_info.left_indices)
+        };
+        
+        // Build hash table on smaller table
+        let hash_table = self.build_hash_table(build_rows, build_indices);
+        
+        // Probe with larger table
+        let mut result = Vec::new();
+        for probe_row in probe_rows.iter() {
+            let probe_key: Vec<Value> = probe_indices.iter().map(|&idx| probe_row[idx].clone()).collect();
+            
+            if let Some(build_indices) = hash_table.get(&probe_key) {
+                for &build_idx in build_indices {
+                    let build_row = &build_rows[build_idx];
+                    // Combine rows (order depends on which was build vs probe)
+                    let combined_row = if left_rows.len() <= right_rows.len() {
+                        [build_row.as_slice(), probe_row.as_slice()].concat()
+                    } else {
+                        [probe_row.as_slice(), build_row.as_slice()].concat()
+                    };
+                    result.push(combined_row);
+                }
+            }
+        }
+        
+        result
     }
 
     /// Evaluate JOIN condition expression

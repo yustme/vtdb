@@ -31,7 +31,7 @@ require(['vs/editor/editor.main'], function () {
         theme: 'neobrutalist',
         automaticLayout: true,
         minimap: { enabled: false },
-        fontSize: 16,
+        fontSize: 13,
         lineNumbers: 'on',
         roundedSelection: false,
         scrollBeyondLastLine: false,
