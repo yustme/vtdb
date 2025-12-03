@@ -57,6 +57,7 @@ impl Planner {
             table: table_name,
             columns: select.columns.clone(),
             filter: select.where_clause.clone(),
+            limit: select.limit,
         })
     }
 

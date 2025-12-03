@@ -27,8 +27,8 @@ impl Executor {
             PhysicalPlan::CreateTable { name, columns } => {
                 self.execute_create_table(name, columns, storage, catalog)
             }
-            PhysicalPlan::Select { table, columns, filter } => {
-                self.execute_select(table, columns, filter, storage, catalog)
+            PhysicalPlan::Select { table, columns, filter, limit } => {
+                self.execute_select(table, columns, filter, limit, storage, catalog)
             }
             PhysicalPlan::Insert { table, columns, values } => {
                 self.execute_insert(table, columns, values, storage, catalog)
@@ -67,6 +67,7 @@ impl Executor {
         table: &str,
         columns: &[crate::parser::ast::SelectItem],
         filter: &Option<crate::parser::ast::Expr>,
+        limit: &Option<u64>,
         storage: &StorageEngine,
         catalog: &Catalog,
     ) -> Result<QueryResult> {
@@ -87,10 +88,24 @@ impl Executor {
             all_rows
         };
 
+        // Apply LIMIT (Snowflake LIMIT behavior: limit the number of rows returned)
+        let limited_rows = if let Some(limit_value) = limit {
+            let limit_usize = *limit_value as usize;
+            let filtered_count = filtered_rows.len();
+            let result: Vec<Vec<Value>> = filtered_rows.into_iter().take(limit_usize).collect();
+            // Debug: verify LIMIT is being applied
+            if result.len() > limit_usize {
+                eprintln!("ERROR: LIMIT {} applied but got {} rows!", limit_usize, result.len());
+            }
+            result
+        } else {
+            filtered_rows
+        };
+
         // Project columns
         let result_rows = if columns.is_empty() || matches!(columns[0], crate::parser::ast::SelectItem::All) {
             // SELECT *
-            filtered_rows
+            limited_rows
         } else {
             // SELECT specific columns
             let mut column_indices = Vec::new();
@@ -112,7 +127,7 @@ impl Executor {
                 }
             }
 
-            filtered_rows
+            limited_rows
                 .into_iter()
                 .map(|row| {
                     column_indices.iter().map(|&idx| row[idx].clone()).collect()

@@ -74,10 +74,21 @@ pub fn convert_statement(stmt: SqlStatement) -> Result<Statement> {
                 .map(|expr| convert_expr(expr))
                 .transpose()?;
 
+            // Parse LIMIT clause (Snowflake supports LIMIT n)
+            let limit = query.limit.as_ref().and_then(|limit_expr| {
+                // LIMIT can be an expression, but we'll handle simple integer literals
+                if let SqlExpr::Value(sqlparser::ast::Value::Number(n, _)) = limit_expr {
+                    n.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            });
+
             Ok(Statement::Select(Select {
                 columns: select_items,
                 from,
                 where_clause,
+                limit,
             }))
         }
         SqlStatement::Insert {

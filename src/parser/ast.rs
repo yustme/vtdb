@@ -31,6 +31,7 @@ pub struct Select {
     pub columns: Vec<SelectItem>,
     pub from: Option<TableRef>,
     pub where_clause: Option<Expr>,
+    pub limit: Option<u64>,
 }
 
 /// SELECT item (column or expression)
