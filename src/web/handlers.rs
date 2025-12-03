@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 use crate::Database;
 
@@ -22,6 +23,28 @@ pub struct ExecuteResponse {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_cache: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct QueryProgressResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::QueryProgressTracker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct QueryResultResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<crate::QueryResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_cache: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -38,7 +61,7 @@ pub struct ListTablesResponse {
     pub error: Option<String>,
 }
 
-/// Execute a SQL query
+/// Execute a SQL query (async with progress tracking for SELECT queries)
 pub async fn execute_query(
     State(db): State<Arc<Mutex<Database>>>,
     Json(request): Json<ExecuteRequest>,
@@ -51,28 +74,130 @@ pub async fn execute_query(
             result: None,
             error: Some("Query cannot be empty".to_string()),
             from_cache: None,
+            query_id: None,
         }));
     }
 
-    let result = {
-        let mut db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db.execute_with_cache_info(query)
+    // Check if this is a SELECT query - if so, use async execution with progress
+    let is_select = query.trim_start().to_uppercase().starts_with("SELECT");
+    
+    if is_select {
+        // Generate query ID
+        let query_id = Uuid::new_v4().to_string();
+        
+        // Start async execution
+        if let Err(e) = Database::execute_async_internal(db.clone(), query_id.clone(), query.to_string()) {
+            return Ok(Json(ExecuteResponse {
+                success: false,
+                result: None,
+                error: Some(e.to_string()),
+                from_cache: None,
+                query_id: None,
+            }));
+        }
+        
+        // Return query ID immediately
+        Ok(Json(ExecuteResponse {
+            success: true,
+            result: None,
+            error: None,
+            from_cache: None,
+            query_id: Some(query_id),
+        }))
+    } else {
+        // For non-SELECT queries, execute synchronously
+        let result = {
+            let mut db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            db.execute_with_cache_info(query)
+        };
+
+        match result {
+            Ok((query_result, from_cache)) => Ok(Json(ExecuteResponse {
+                success: true,
+                result: Some(query_result),
+                error: None,
+                from_cache: Some(from_cache),
+                query_id: None,
+            })),
+            Err(e) => Ok(Json(ExecuteResponse {
+                success: false,
+                result: None,
+                error: Some(e.to_string()),
+                from_cache: None,
+                query_id: None,
+            })),
+        }
+    }
+}
+
+/// Get query progress
+pub async fn get_query_progress(
+    State(db): State<Arc<Mutex<Database>>>,
+    Path(query_id): Path<String>,
+) -> Result<Json<QueryProgressResponse>, StatusCode> {
+    let progress = {
+        let db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db.get_query_progress(&query_id)
     };
 
-    match result {
-        Ok((query_result, from_cache)) => Ok(Json(ExecuteResponse {
-            success: true,
-            result: Some(query_result),
-            error: None,
-            from_cache: Some(from_cache),
-        })),
-        Err(e) => Ok(Json(ExecuteResponse {
+    match progress {
+        Some(mut tracker) => {
+            // Update elapsed time
+            tracker.update_elapsed();
+            Ok(Json(QueryProgressResponse {
+                success: true,
+                progress: Some(tracker),
+                error: None,
+            }))
+        }
+        None => Ok(Json(QueryProgressResponse {
             success: false,
-            result: None,
-            error: Some(e.to_string()),
-            from_cache: None,
+            progress: None,
+            error: Some("Query not found".to_string()),
         })),
     }
+}
+
+/// Get query result
+pub async fn get_query_result(
+    State(db): State<Arc<Mutex<Database>>>,
+    Path(query_id): Path<String>,
+) -> Result<Json<QueryResultResponse>, StatusCode> {
+    let result_storage = {
+        let db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db.get_query_result(&query_id)
+    };
+
+    match result_storage {
+        Some(storage) => Ok(Json(QueryResultResponse {
+            success: true,
+            result: storage.result,
+            from_cache: Some(storage.from_cache),
+            error: None,
+        })),
+        None => Ok(Json(QueryResultResponse {
+            success: false,
+            result: None,
+            from_cache: None,
+            error: Some("Query result not found or query still running".to_string()),
+        })),
+    }
+}
+
+/// Cancel a query
+pub async fn cancel_query(
+    State(db): State<Arc<Mutex<Database>>>,
+    Path(query_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let cancelled = {
+        let db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db.cancel_query(&query_id)
+    };
+
+    Ok(Json(serde_json::json!({
+        "success": cancelled,
+        "message": if cancelled { "Query cancelled" } else { "Query not found" }
+    })))
 }
 
 /// List all tables in the database

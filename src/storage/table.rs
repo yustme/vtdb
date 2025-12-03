@@ -101,6 +101,28 @@ impl Table {
         rows
     }
 
+    /// Scan a chunk of rows starting from start_idx
+    /// Returns rows from start_idx to start_idx + chunk_size (or end of table)
+    pub fn scan_chunk(&self, start_idx: usize, chunk_size: usize) -> Vec<Vec<Value>> {
+        let end_idx = (start_idx + chunk_size).min(self.row_count);
+        if start_idx >= self.row_count {
+            return Vec::new();
+        }
+        
+        let chunk_size_actual = end_idx - start_idx;
+        let mut rows = Vec::with_capacity(chunk_size_actual);
+        
+        for row_idx in start_idx..end_idx {
+            let mut row = Vec::with_capacity(self.columns.len());
+            for col in &self.columns {
+                row.push(col.data[row_idx].clone());
+            }
+            rows.push(row);
+        }
+        
+        rows
+    }
+
     pub fn update_rows(
         &mut self,
         column_idx: usize,

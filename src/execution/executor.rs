@@ -4,6 +4,8 @@ use crate::planner::physical::PhysicalPlan;
 use crate::storage::StorageEngine;
 use crate::Value;
 use crate::QueryResult;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 /// Query executor that executes physical plans
 #[derive(Clone)]
@@ -125,12 +127,24 @@ impl Executor {
         storage: &mut StorageEngine,
         catalog: &mut Catalog,
     ) -> Result<QueryResult> {
+        self.execute_with_progress(plan, storage, catalog, None, None)
+    }
+
+    /// Execute with optional progress tracking
+    pub fn execute_with_progress(
+        &self,
+        plan: &PhysicalPlan,
+        storage: &mut StorageEngine,
+        catalog: &mut Catalog,
+        active_queries: Option<Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>>,
+        query_id: Option<&str>,
+    ) -> Result<QueryResult> {
         match plan {
             PhysicalPlan::CreateTable { name, columns } => {
                 self.execute_create_table(name, columns, storage, catalog)
             }
             PhysicalPlan::Select { from, columns, filter, group_by, limit } => {
-                self.execute_select(from, columns, filter, group_by, limit, storage, catalog)
+                self.execute_select_with_progress(from, columns, filter, group_by, limit, storage, catalog, active_queries, query_id)
             }
             PhysicalPlan::Insert { table, columns, values } => {
                 self.execute_insert(table, columns, values, storage, catalog)
@@ -220,13 +234,93 @@ impl Executor {
         self.finish_select_execution(filtered_rows, &combined_schema, columns, filter, group_by, limit)
     }
 
+    /// Execute SELECT query with progress tracking (public method)
+    pub fn execute_select_with_progress_direct(
+        &self,
+        plan: &PhysicalPlan,
+        storage: &mut StorageEngine,
+        catalog: &Catalog,
+        active_queries: Option<Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>>,
+        query_id: Option<&str>,
+    ) -> Result<QueryResult> {
+        match plan {
+            PhysicalPlan::Select { from, columns, filter, group_by, limit } => {
+                self.execute_select_with_progress(from, columns, filter, group_by, limit, storage, catalog, active_queries, query_id)
+            }
+            _ => Err(anyhow::anyhow!("This method only supports SELECT queries"))
+        }
+    }
+
+    /// Execute SELECT with progress tracking
+    fn execute_select_with_progress(
+        &self,
+        from: &crate::parser::ast::TableRef,
+        columns: &[crate::parser::ast::SelectItem],
+        filter: &Option<crate::parser::ast::Expr>,
+        group_by: &Option<Vec<String>>,
+        limit: &Option<u64>,
+        storage: &StorageEngine,
+        catalog: &Catalog,
+        active_queries: Option<Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>>,
+        query_id: Option<&str>,
+    ) -> Result<QueryResult> {
+        const CHUNK_SIZE: usize = 10000;
+
+        // If no progress tracking, use regular execution
+        if active_queries.is_none() || query_id.is_none() {
+            return self.execute_select(from, columns, filter, group_by, limit, storage, catalog);
+        }
+
+        let active_queries = active_queries.unwrap();
+        let query_id = query_id.unwrap();
+
+        // Try to use index scan for single table queries with filters
+        let (all_rows, combined_schema) = match (from, filter) {
+            (crate::parser::ast::TableRef::Table { name, alias }, Some(filter_expr)) => {
+                // Check if we can use an index
+                if let Some((column_name, key_value)) = self.extract_equality_predicate(filter_expr) {
+                    // Try to use index for equality lookup
+                    use crate::execution::operators::IndexScan;
+                    let row_ids = IndexScan::scan_by_key(name, &column_name, key_value, storage)?;
+                    if !row_ids.is_empty() {
+                        // Use index scan - no progress tracking needed for indexed lookups
+                        let rows = IndexScan::get_rows_by_ids(name, &row_ids, storage)?;
+                        let schema = catalog.get_table(name)?;
+                        let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
+                        return self.finish_select_execution(rows, &combined_schema, columns, filter, group_by, limit);
+                    }
+                }
+                // Fall back to chunked scan
+                self.execute_table_ref_with_progress(from, storage, catalog, &active_queries, query_id, CHUNK_SIZE)?
+            }
+            _ => {
+                // Execute JOINs or single table scan with progress
+                self.execute_table_ref_with_progress(from, storage, catalog, &active_queries, query_id, CHUNK_SIZE)?
+            }
+        };
+
+        // Apply filter
+        let filtered_rows = if let Some(filter_expr) = filter {
+            all_rows
+                .into_iter()
+                .filter(|row| {
+                    self.evaluate_predicate_with_schema(filter_expr, row, &combined_schema).unwrap_or(false)
+                })
+                .collect()
+        } else {
+            all_rows
+        };
+
+        self.finish_select_execution(filtered_rows, &combined_schema, columns, filter, group_by, limit)
+    }
+
     /// Finish SELECT execution (common code for both index and table scans)
     fn finish_select_execution(
         &self,
         filtered_rows: Vec<Vec<Value>>,
         combined_schema: &CombinedSchema,
         columns: &[crate::parser::ast::SelectItem],
-        filter: &Option<crate::parser::ast::Expr>,
+        _filter: &Option<crate::parser::ast::Expr>,
         group_by: &Option<Vec<String>>,
         limit: &Option<u64>,
     ) -> Result<QueryResult> {
@@ -311,6 +405,102 @@ impl Executor {
             }
             crate::parser::ast::TableRef::Join { left, right, join_type, condition } => {
                 self.execute_join(left, right, join_type, condition, storage, catalog)
+            }
+        }
+    }
+
+    /// Execute a TableRef with progress tracking using chunked scans
+    fn execute_table_ref_with_progress(
+        &self,
+        table_ref: &crate::parser::ast::TableRef,
+        storage: &StorageEngine,
+        catalog: &Catalog,
+        active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
+        query_id: &str,
+        chunk_size: usize,
+    ) -> Result<(Vec<Vec<Value>>, CombinedSchema)> {
+        match table_ref {
+            crate::parser::ast::TableRef::Table { name, alias } => {
+                let schema = catalog.get_table(name)?;
+                
+                // Get total row count for progress tracking
+                let total_rows = storage.get_row_count(name).unwrap_or(0);
+                
+                // Update progress tracker
+                if let Ok(mut queries) = active_queries.lock() {
+                    if let Some(tracker) = queries.get_mut(query_id) {
+                        tracker.update_table_progress(name.clone(), 0, total_rows);
+                        tracker.estimated_total_rows = total_rows;
+                        tracker.set_stage(format!("Scanning table {}", name));
+                    }
+                }
+
+                // Scan table in chunks
+                let mut all_rows = Vec::new();
+                let mut start_idx = 0;
+                
+                while start_idx < total_rows {
+                    // Check if query was cancelled
+                    if let Ok(queries) = active_queries.lock() {
+                        if let Some(tracker) = queries.get(query_id) {
+                            if tracker.status == crate::QueryStatus::Cancelled {
+                                return Err(anyhow::anyhow!("Query cancelled"));
+                            }
+                        }
+                    }
+
+                    // Scan chunk
+                    let chunk = storage.scan_table_chunk(name, start_idx, chunk_size)?;
+                    all_rows.extend(chunk);
+                    start_idx += chunk_size;
+
+                    // Update progress
+                    if let Ok(mut queries) = active_queries.lock() {
+                        if let Some(tracker) = queries.get_mut(query_id) {
+                            tracker.update_table_progress(name.clone(), start_idx.min(total_rows), total_rows);
+                            tracker.rows_processed = start_idx.min(total_rows);
+                        }
+                    }
+
+                    // Yield to other tasks periodically (every chunk)
+                    std::thread::yield_now();
+                }
+
+                let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
+                Ok((all_rows, combined_schema))
+            }
+            crate::parser::ast::TableRef::Join { left, right, join_type, condition } => {
+                // For JOINs, recursively scan with progress
+                let (left_rows, left_schema) = self.execute_table_ref_with_progress(
+                    left, storage, catalog, active_queries, query_id, chunk_size
+                )?;
+                let (right_rows, right_schema) = self.execute_table_ref_with_progress(
+                    right, storage, catalog, active_queries, query_id, chunk_size
+                )?;
+                
+                // Combine schemas
+                let combined_schema = CombinedSchema::from_join(&left_schema, &right_schema)?;
+                
+                // Perform JOIN
+                let joined_rows = match join_type {
+                    crate::parser::ast::JoinType::Inner => {
+                        self.inner_join(&left_rows, &right_rows, condition, &left_schema, &right_schema)?
+                    }
+                    crate::parser::ast::JoinType::Left => {
+                        self.left_join(&left_rows, &right_rows, condition, &left_schema, &right_schema)?
+                    }
+                    crate::parser::ast::JoinType::Right => {
+                        self.right_join(&left_rows, &right_rows, condition, &left_schema, &right_schema)?
+                    }
+                    crate::parser::ast::JoinType::FullOuter => {
+                        self.full_outer_join(&left_rows, &right_rows, condition, &left_schema, &right_schema)?
+                    }
+                    crate::parser::ast::JoinType::Cross => {
+                        self.cross_join(&left_rows, &right_rows)?
+                    }
+                };
+                
+                Ok((joined_rows, combined_schema))
             }
         }
     }

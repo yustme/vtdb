@@ -2,6 +2,8 @@ let editor;
 let currentAbortController = null;
 let executionTimerInterval = null;
 let executionStartTime = null;
+let progressPollInterval = null;
+let currentQueryId = null;
 
 // Initialize Monaco Editor
 require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
@@ -168,31 +170,49 @@ async function executeQuery() {
         
         const data = await response.json();
         
-        // Stop timer
-        stopExecutionTimer();
-        
-        // Calculate execution time
-        const endTime = performance.now();
-        const executionTime = endTime - executionStartTime;
-        
-        // Reset button
-        resetExecuteButton();
-        
         if (data.success) {
-            if (data.result) {
-                displayResults(data.result, executionTime, data.from_cache || false);
+            // Check if this is an async query (has query_id)
+            if (data.query_id) {
+                currentQueryId = data.query_id;
+                // Keep timer running for async queries - start polling for progress
+                startProgressPolling(data.query_id);
             } else {
-                const cacheText = data.from_cache ? ' • Cache used' : '';
-                showSuccess(`Query executed successfully (no results) - Execution time: ${formatExecutionTime(executionTime)}${cacheText}`);
+                // Stop timer for synchronous queries
+                stopExecutionTimer();
+                if (data.result) {
+                    // Synchronous execution completed immediately
+                    const endTime = performance.now();
+                    const executionTime = endTime - executionStartTime;
+                    resetExecuteButton();
+                    displayResults(data.result, executionTime, data.from_cache || false);
+                } else {
+                    // No results
+                    const endTime = performance.now();
+                    const executionTime = endTime - executionStartTime;
+                    resetExecuteButton();
+                    const cacheText = data.from_cache ? ' • Cache used' : '';
+                    showSuccess(`Query executed successfully (no results) - Execution time: ${formatExecutionTime(executionTime)}${cacheText}`);
+                }
             }
         } else {
+            resetExecuteButton();
             showError(data.error || 'Unknown error occurred');
         }
     } catch (error) {
         stopExecutionTimer();
+        stopProgressPolling();
         resetExecuteButton();
         
         if (error.name === 'AbortError') {
+            // Cancel the query on the server if we have a query_id
+            if (currentQueryId) {
+                try {
+                    await fetch(`/api/query/${currentQueryId}`, { method: 'DELETE' });
+                } catch (e) {
+                    // Ignore cancellation errors
+                }
+                currentQueryId = null;
+            }
             resultsContainer.innerHTML = '<div class="info-message">Query execution cancelled by user</div>';
         } else {
             showError('Failed to execute query: ' + error.message);
@@ -203,10 +223,32 @@ async function executeQuery() {
     }
 }
 
-function cancelQuery() {
+async function cancelQuery() {
+    // Cancel abort controller for fetch request
     if (currentAbortController) {
         currentAbortController.abort();
     }
+    
+    // Cancel query on server if we have a query_id
+    if (currentQueryId) {
+        try {
+            await fetch(`/api/query/${currentQueryId}`, { method: 'DELETE' });
+        } catch (err) {
+            console.error('Failed to cancel query on server:', err);
+        }
+        currentQueryId = null;
+    }
+    
+    // Stop timers and polling
+    stopExecutionTimer();
+    stopProgressPolling();
+    
+    // Reset button
+    resetExecuteButton();
+    
+    // Show cancellation message
+    const resultsContainer = document.getElementById('results-container');
+    resultsContainer.innerHTML = '<div class="info-message">Query execution cancelled by user</div>';
 }
 
 function resetExecuteButton() {
@@ -239,12 +281,194 @@ function stopExecutionTimer() {
     }
 }
 
+function startProgressPolling(queryId) {
+    // Clear any existing polling
+    stopProgressPolling();
+    
+    // Poll immediately
+    pollProgress(queryId);
+    
+    // Poll every 5 seconds for progress updates
+    progressPollInterval = setInterval(() => {
+        pollProgress(queryId);
+    }, 5000);
+    
+    // Keep the execution timer running to update elapsed time in progress display
+    // The timer interval should already be running from startExecutionTimer()
+    // But we'll ensure it updates the progress display
+}
+
+function stopProgressPolling() {
+    if (progressPollInterval) {
+        clearInterval(progressPollInterval);
+        progressPollInterval = null;
+    }
+}
+
+async function pollProgress(queryId) {
+    try {
+        const response = await fetch(`/api/query/${queryId}/progress`);
+        const data = await response.json();
+        
+        if (data.success && data.progress) {
+            displayProgress(data.progress);
+            
+            // Check if query is completed
+            if (data.progress.status === 'Completed') {
+                stopProgressPolling();
+                stopExecutionTimer();
+                // Fetch the result
+                await fetchQueryResult(queryId);
+            } else if (data.progress.status === 'Failed' || data.progress.status === 'Cancelled') {
+                stopProgressPolling();
+                stopExecutionTimer();
+                resetExecuteButton();
+                const errorMsg = data.progress.error_message || `Query ${data.progress.status.toLowerCase()}`;
+                showError(errorMsg);
+            }
+        }
+    } catch (error) {
+        console.error('Failed to poll progress:', error);
+    }
+}
+
+async function fetchQueryResult(queryId) {
+    try {
+        const response = await fetch(`/api/query/${queryId}/result`);
+        const data = await response.json();
+        
+        if (data.success && data.result) {
+            const endTime = performance.now();
+            const executionTime = endTime - executionStartTime;
+            stopExecutionTimer();
+            resetExecuteButton();
+            displayResults(data.result, executionTime, data.from_cache || false);
+        } else {
+            stopExecutionTimer();
+            showError(data.error || 'Failed to fetch query result');
+        }
+    } catch (error) {
+        stopExecutionTimer();
+        showError('Failed to fetch query result: ' + error.message);
+    } finally {
+        currentQueryId = null;
+    }
+}
+
+function updateProgressTimer() {
+    // Update elapsed time in progress display if it exists
+    if (!currentQueryId || !executionStartTime) return;
+    
+    const resultsContainer = document.getElementById('results-container');
+    const progressDisplay = resultsContainer.querySelector('.progress-display');
+    if (progressDisplay) {
+        const elapsed = performance.now() - executionStartTime;
+        const elapsedFormatted = formatExecutionTime(elapsed);
+        const statusDiv = progressDisplay.querySelector('.progress-status');
+        if (statusDiv) {
+            // Extract status from current progress or use Running
+            const statusText = statusDiv.textContent.match(/Status:\s*<strong>([^<]+)<\/strong>/);
+            const status = statusText ? statusText[1] : 'Running';
+            statusDiv.innerHTML = `Status: <strong>${status}</strong> • Running for: ${elapsedFormatted}`;
+        }
+    }
+}
+
+function displayProgress(progress) {
+    const resultsContainer = document.getElementById('results-container');
+    
+    // Calculate elapsed time for display
+    const elapsed = executionStartTime ? (performance.now() - executionStartTime) : 0;
+    const elapsedFormatted = formatExecutionTime(elapsed);
+    
+    let progressHtml = '<div class="progress-display">';
+    progressHtml += `<div class="progress-header">`;
+    progressHtml += `<h3>Query Progress</h3>`;
+    progressHtml += `<div class="progress-status">Status: <strong>${progress.status}</strong> • Running for: ${elapsedFormatted}</div>`;
+    progressHtml += `</div>`;
+    
+    progressHtml += `<div class="progress-stage">Current Stage: ${progress.current_stage}</div>`;
+    
+    // Add cancel button
+    progressHtml += `<div style="margin-top: 15px;">`;
+    progressHtml += `<button class="cancel-query-btn" id="progress-cancel-btn">Cancel Query</button>`;
+    progressHtml += `</div>`;
+    
+    // Overall progress
+    const progressPercent = progress.estimated_total_rows > 0 
+        ? Math.round((progress.rows_processed / progress.estimated_total_rows) * 100)
+        : 0;
+    progressHtml += `<div class="progress-bar-container">`;
+    progressHtml += `<div class="progress-bar" style="width: ${progressPercent}%"></div>`;
+    progressHtml += `</div>`;
+    progressHtml += `<div class="progress-info">Rows processed: ${progress.rows_processed.toLocaleString()} / ${progress.estimated_total_rows.toLocaleString()} (${progressPercent}%)</div>`;
+    
+    // Table progress
+    if (progress.tables_scanned && progress.tables_scanned.length > 0) {
+        progressHtml += `<div class="table-progress-list">`;
+        progress.tables_scanned.forEach(table => {
+            const tablePercent = table.total_rows > 0 
+                ? Math.round((table.rows_scanned / table.total_rows) * 100)
+                : 0;
+            progressHtml += `<div class="table-progress-item">`;
+            progressHtml += `<div class="table-progress-name">${table.table_name}</div>`;
+            progressHtml += `<div class="table-progress-bar-container">`;
+            progressHtml += `<div class="table-progress-bar" style="width: ${tablePercent}%"></div>`;
+            progressHtml += `</div>`;
+            progressHtml += `<div class="table-progress-info">${table.rows_scanned.toLocaleString()} / ${table.total_rows.toLocaleString()} rows (${tablePercent}%)</div>`;
+            progressHtml += `</div>`;
+        });
+        progressHtml += `</div>`;
+    }
+    
+    // Estimated time remaining
+    if (progress.rows_processed > 0 && progress.estimated_total_rows > 0) {
+        const elapsed = progress.elapsed_seconds || 0;
+        const rate = progress.rows_processed / elapsed; // rows per second
+        if (rate > 0) {
+            const remaining = progress.estimated_total_rows - progress.rows_processed;
+            const estimatedSeconds = remaining / rate;
+            progressHtml += `<div class="progress-estimate">Estimated remaining: ~${formatTimeEstimate(estimatedSeconds)}</div>`;
+        }
+    }
+    
+    progressHtml += `</div>`;
+    
+    resultsContainer.innerHTML = progressHtml;
+    
+    // Add event listener to cancel button
+    const cancelBtn = document.getElementById('progress-cancel-btn');
+    if (cancelBtn) {
+        cancelBtn.addEventListener('click', cancelQuery);
+    }
+}
+
+function formatTimeEstimate(seconds) {
+    if (seconds < 60) {
+        return `${Math.round(seconds)}s`;
+    } else if (seconds < 3600) {
+        return `${Math.round(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+    } else {
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        return `${hours}h ${minutes}m`;
+    }
+}
+
 function updateExecutionTimer() {
     if (!executionStartTime) return;
     
-    const resultsContainer = document.getElementById('results-container');
     const elapsed = performance.now() - executionStartTime;
     const elapsedFormatted = formatExecutionTime(elapsed);
+    
+    // If we have an async query, update the progress display timer
+    if (currentQueryId) {
+        updateProgressTimer();
+        return;
+    }
+    
+    // For synchronous queries, update the loading display
+    const resultsContainer = document.getElementById('results-container');
     
     const loadingDiv = document.createElement('div');
     loadingDiv.className = 'loading';

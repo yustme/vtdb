@@ -1,6 +1,6 @@
 use crate::Database;
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,10 @@ pub async fn start_server(db: Arc<Mutex<Database>>) -> anyhow::Result<()> {
     let api_routes = Router::new()
         .route("/api/execute", post(handlers::execute_query))
         .route("/api/tables", get(handlers::list_tables))
-        .route("/api/table/:name", get(handlers::get_table_schema));
+        .route("/api/table/:name", get(handlers::get_table_schema))
+        .route("/api/query/:query_id/progress", get(handlers::get_query_progress))
+        .route("/api/query/:query_id/result", get(handlers::get_query_result))
+        .route("/api/query/:query_id", delete(handlers::cancel_query));
     
     let app = Router::new()
         .merge(api_routes)

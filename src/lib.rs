@@ -20,6 +20,93 @@ use storage::StorageEngine;
 use transaction::TransactionManager;
 use parser::ast::{Statement, hash_statement};
 use cache::extract_table_dependencies;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::time::Instant;
+
+/// Query status
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub enum QueryStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Table progress information
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TableProgress {
+    pub table_name: String,
+    pub rows_scanned: usize,
+    pub total_rows: usize,
+}
+
+/// Query progress tracker
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryProgressTracker {
+    pub query_id: String,
+    pub status: QueryStatus,
+    pub tables_scanned: Vec<TableProgress>,
+    pub current_stage: String,
+    pub rows_processed: usize,
+    pub estimated_total_rows: usize,
+    #[serde(skip_serializing)]
+    pub start_time: Instant,
+    pub error_message: Option<String>,
+    #[serde(skip_serializing)]
+    pub elapsed_seconds: f64,
+}
+
+impl QueryProgressTracker {
+    pub fn new(query_id: String) -> Self {
+        Self {
+            query_id,
+            status: QueryStatus::Running,
+            tables_scanned: Vec::new(),
+            current_stage: "Initializing".to_string(),
+            rows_processed: 0,
+            estimated_total_rows: 0,
+            start_time: Instant::now(),
+            error_message: None,
+            elapsed_seconds: 0.0,
+        }
+    }
+
+    pub fn update_elapsed(&mut self) {
+        self.elapsed_seconds = self.start_time.elapsed().as_secs_f64();
+    }
+
+    pub fn update_table_progress(&mut self, table_name: String, rows_scanned: usize, total_rows: usize) {
+        if let Some(table_progress) = self.tables_scanned.iter_mut().find(|t| t.table_name == table_name) {
+            table_progress.rows_scanned = rows_scanned;
+            table_progress.total_rows = total_rows;
+        } else {
+            self.tables_scanned.push(TableProgress {
+                table_name,
+                rows_scanned,
+                total_rows,
+            });
+        }
+    }
+
+    pub fn set_stage(&mut self, stage: String) {
+        self.current_stage = stage;
+    }
+
+    pub fn get_progress_percentage(&self) -> f64 {
+        if self.estimated_total_rows == 0 {
+            return 0.0;
+        }
+        (self.rows_processed as f64 / self.estimated_total_rows as f64 * 100.0).min(100.0)
+    }
+}
+
+/// Query result storage
+#[derive(Debug, Clone)]
+pub struct QueryResultStorage {
+    pub result: Option<QueryResult>,
+    pub from_cache: bool,
+}
 
 /// Main database instance
 pub struct Database {
@@ -29,6 +116,8 @@ pub struct Database {
     executor: Executor,
     transaction_manager: TransactionManager,
     cache: QueryCache,
+    active_queries: Arc<Mutex<HashMap<String, QueryProgressTracker>>>,
+    query_results: Arc<Mutex<HashMap<String, QueryResultStorage>>>,
 }
 
 impl Database {
@@ -48,6 +137,8 @@ impl Database {
             executor,
             transaction_manager,
             cache,
+            active_queries: Arc::new(Mutex::new(HashMap::new())),
+            query_results: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -160,6 +251,231 @@ impl Database {
             row_count,
             storage_size_bytes,
         })
+    }
+
+    /// Get query progress
+    pub fn get_query_progress(&self, query_id: &str) -> Option<QueryProgressTracker> {
+        self.active_queries.lock().ok()
+            .and_then(|queries| queries.get(query_id).cloned())
+    }
+
+    /// Get query result
+    pub fn get_query_result(&self, query_id: &str) -> Option<QueryResultStorage> {
+        self.query_results.lock().ok()
+            .and_then(|results| results.get(query_id).cloned())
+    }
+
+    /// Cancel a query
+    pub fn cancel_query(&self, query_id: &str) -> bool {
+        if let Ok(mut queries) = self.active_queries.lock() {
+            if let Some(tracker) = queries.get_mut(query_id) {
+                tracker.status = QueryStatus::Cancelled;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Start async query execution (takes Arc<Mutex<Database>> for async execution)
+    pub fn execute_async_internal(
+        db: Arc<Mutex<Database>>,
+        query_id: String,
+        sql: String,
+    ) -> Result<()> {
+        // Create progress tracker
+        let tracker = QueryProgressTracker::new(query_id.clone());
+        
+        // Store initial tracker
+        {
+            let db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+            let mut queries = db_guard.active_queries.lock().map_err(|_| {
+                anyhow::anyhow!("Failed to lock active queries")
+            })?;
+            queries.insert(query_id.clone(), tracker);
+        }
+
+        // Spawn async task
+        tokio::spawn(async move {
+            let result = execute_query_with_progress(db.clone(), query_id.clone(), sql).await;
+
+            // Update tracker and store result
+            if let Ok((query_result, from_cache)) = result {
+                // Update tracker to completed
+                if let Ok(db_guard) = db.lock() {
+                    if let Ok(mut queries) = db_guard.active_queries.lock() {
+                        if let Some(tracker) = queries.get_mut(&query_id) {
+                            tracker.status = QueryStatus::Completed;
+                            tracker.rows_processed = tracker.estimated_total_rows;
+                        }
+                    }
+                }
+
+                // Store result
+                if let Ok(db_guard) = db.lock() {
+                    if let Ok(mut results) = db_guard.query_results.lock() {
+                        results.insert(query_id.clone(), QueryResultStorage {
+                            result: Some(query_result),
+                            from_cache,
+                        });
+                    }
+                }
+            } else if let Err(e) = result {
+                // Update tracker to failed
+                if let Ok(db_guard) = db.lock() {
+                    if let Ok(mut queries) = db_guard.active_queries.lock() {
+                        if let Some(tracker) = queries.get_mut(&query_id) {
+                            tracker.status = QueryStatus::Failed;
+                            tracker.error_message = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+}
+
+/// Execute query with progress tracking (helper function for async execution)
+async fn execute_query_with_progress(
+    db: Arc<Mutex<Database>>,
+    query_id: String,
+    sql: String,
+) -> Result<(QueryResult, bool)> {
+    // Parse SQL
+    let ast = parse_sql(&sql)?;
+
+    // Check cache for SELECT queries
+    let (from_cache, query_hash) = if let Statement::Select(_) = &ast {
+        let query_hash = hash_statement(&ast);
+        let mut db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+        
+        if let Some(cached_result) = db_guard.cache.get(query_hash) {
+            return Ok((cached_result, true));
+        }
+        (false, Some(query_hash))
+    } else {
+        (false, None)
+    };
+
+    // Update progress: Planning
+    update_progress_stage(&db, &query_id, "Planning query".to_string());
+
+    // Plan query
+    let plan = {
+        let db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+        db_guard.planner.plan(&ast, &db_guard.catalog)?
+    };
+
+    // Update progress: Executing
+    update_progress_stage(&db, &query_id, "Executing query".to_string());
+
+    // Execute query with progress tracking
+    // For SELECT queries, use progress-aware execution
+    let result = if let Statement::Select(_) = &ast {
+        // Use the progress-aware execution path for SELECT queries
+        let active_queries_clone = {
+            let db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+            db_guard.active_queries.clone()
+        };
+        
+        // Extract executor to avoid borrow checker issues
+        let executor = {
+            let db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+            db_guard.executor.clone()
+        };
+        
+        // Execute with progress - use a helper to avoid borrow conflicts
+        execute_with_progress_helper(
+            &executor,
+            &plan,
+            db.clone(),
+            Some(active_queries_clone),
+            Some(&query_id),
+        )?
+    } else {
+        // Fall back to regular execution for non-SELECT queries
+        let executor = {
+            let db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+            db_guard.executor.clone()
+        };
+        
+        let mut db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+        let storage_ptr: *mut StorageEngine = &mut db_guard.storage;
+        let catalog_ptr: *mut Catalog = &mut db_guard.catalog;
+        
+        // SAFETY: storage and catalog are separate fields, so these pointers don't alias
+        unsafe {
+            executor.execute(&plan, &mut *storage_ptr, &mut *catalog_ptr)?
+        }
+    };
+
+    // Cache SELECT query results
+    if let Some(query_hash) = query_hash {
+        let table_dependencies = extract_table_dependencies(&ast);
+        let mut db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+        db_guard.cache.put(query_hash, result.clone(), table_dependencies);
+    }
+
+    // Invalidate cache for write operations
+    let mut db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+    match &ast {
+        Statement::Insert(insert) => {
+            db_guard.cache.invalidate_tables(&[insert.table.clone()]);
+        }
+        Statement::Update(update) => {
+            db_guard.cache.invalidate_tables(&[update.table.clone()]);
+        }
+        Statement::Delete(delete) => {
+            db_guard.cache.invalidate_tables(&[delete.table.clone()]);
+        }
+        Statement::CreateTable(_) => {}
+        Statement::Select(_) => {}
+    }
+
+    Ok((result, from_cache))
+}
+
+/// Helper to update progress stage
+fn update_progress_stage(db: &Arc<Mutex<Database>>, query_id: &str, stage: String) {
+    if let Ok(db_guard) = db.lock() {
+        if let Ok(mut queries) = db_guard.active_queries.lock() {
+            if let Some(tracker) = queries.get_mut(query_id) {
+                tracker.set_stage(stage);
+            }
+        }
+    }
+}
+
+/// Helper function to execute with progress, avoiding borrow checker issues
+fn execute_with_progress_helper(
+    executor: &Executor,
+    plan: &crate::planner::physical::PhysicalPlan,
+    db: Arc<Mutex<Database>>,
+    active_queries: Option<Arc<Mutex<HashMap<String, QueryProgressTracker>>>>,
+    query_id: Option<&str>,
+) -> Result<QueryResult> {
+    // Lock database and extract storage and catalog references
+    // We need to use unsafe to get mutable references to both fields
+    // This is safe because storage and catalog don't overlap in memory
+    let mut db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+    
+    // Use unsafe to get mutable references to both fields
+    // This is safe because we're not aliasing and the references don't overlap
+    let storage_ptr: *mut StorageEngine = &mut db_guard.storage;
+    let catalog_ptr: *mut Catalog = &mut db_guard.catalog;
+    
+    // Execute with the raw pointers converted back to references
+    // This avoids the borrow checker issue
+    // SAFETY: storage and catalog are separate fields, so these pointers don't alias
+    unsafe {
+        Ok(executor.execute_with_progress(
+            plan,
+            &mut *storage_ptr,
+            &mut *catalog_ptr,
+            active_queries,
+            query_id,
+        )?)
     }
 }
 

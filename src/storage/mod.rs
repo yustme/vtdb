@@ -90,6 +90,14 @@ impl StorageEngine {
         Ok(table.scan_all())
     }
 
+    /// Scan a chunk of rows from a table
+    pub fn scan_table_chunk(&self, table_name: &str, start_idx: usize, chunk_size: usize) -> Result<Vec<Vec<Value>>> {
+        let table = self.tables.get(table_name).ok_or_else(|| {
+            anyhow::anyhow!("Table '{}' not found", table_name)
+        })?;
+        Ok(table.scan_chunk(start_idx, chunk_size))
+    }
+
     /// Update rows in a table
     pub fn update_rows(
         &mut self,
