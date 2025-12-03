@@ -89,6 +89,22 @@ impl StorageEngine {
         self.wal.append_delete(table_name)?;
         Ok(deleted)
     }
+
+    /// Get row count for a table
+    pub fn get_row_count(&self, table_name: &str) -> Result<usize> {
+        let table = self.tables.get(table_name).ok_or_else(|| {
+            anyhow::anyhow!("Table '{}' not found", table_name)
+        })?;
+        Ok(table.row_count())
+    }
+
+    /// Estimate storage size in bytes for a table
+    pub fn estimate_storage_size(&self, table_name: &str) -> Result<usize> {
+        let table = self.tables.get(table_name).ok_or_else(|| {
+            anyhow::anyhow!("Table '{}' not found", table_name)
+        })?;
+        Ok(table.estimate_size())
+    }
 }
 
 impl Default for StorageEngine {

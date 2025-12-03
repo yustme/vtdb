@@ -20,12 +20,20 @@ pub struct ExecuteResponse {
     pub result: Option<crate::QueryResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_cache: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct TableInfo {
+    pub name: String,
+    pub row_count: usize,
 }
 
 #[derive(Serialize)]
 pub struct ListTablesResponse {
     pub success: bool,
-    pub tables: Vec<String>,
+    pub tables: Vec<TableInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -42,24 +50,27 @@ pub async fn execute_query(
             success: false,
             result: None,
             error: Some("Query cannot be empty".to_string()),
+            from_cache: None,
         }));
     }
 
     let result = {
         let mut db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db.execute(query)
+        db.execute_with_cache_info(query)
     };
 
     match result {
-        Ok(query_result) => Ok(Json(ExecuteResponse {
+        Ok((query_result, from_cache)) => Ok(Json(ExecuteResponse {
             success: true,
             result: Some(query_result),
             error: None,
+            from_cache: Some(from_cache),
         })),
         Err(e) => Ok(Json(ExecuteResponse {
             success: false,
             result: None,
             error: Some(e.to_string()),
+            from_cache: None,
         })),
     }
 }
@@ -70,7 +81,18 @@ pub async fn list_tables(
 ) -> Result<Json<ListTablesResponse>, StatusCode> {
     let tables = {
         let db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db.list_tables()
+        let table_names = db.list_tables();
+        let mut table_infos = Vec::new();
+        
+        for table_name in table_names {
+            let row_count = db.get_table_row_count(&table_name).unwrap_or(0);
+            table_infos.push(TableInfo {
+                name: table_name,
+                row_count,
+            });
+        }
+        
+        table_infos
     };
 
     Ok(Json(ListTablesResponse {

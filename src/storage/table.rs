@@ -149,5 +149,41 @@ impl Table {
     pub fn row_count(&self) -> usize {
         self.row_count
     }
+
+    /// Estimate the memory size of the table in bytes
+    pub fn estimate_size(&self) -> usize {
+        let mut size = 0;
+        
+        // Size of table structure itself
+        size += std::mem::size_of::<Table>();
+        size += self.name.capacity();
+        
+        // Size of columns vector
+        size += std::mem::size_of::<Vec<Column>>();
+        size += self.columns.capacity() * std::mem::size_of::<Column>();
+        
+        // Size of each column's data
+        for column in &self.columns {
+            size += std::mem::size_of::<Vec<Value>>();
+            size += column.data.capacity() * std::mem::size_of::<Value>();
+            
+            // Estimate size of actual values
+            for value in &column.data {
+                size += estimate_value_size(value);
+            }
+        }
+        
+        size
+    }
+}
+
+/// Estimate the size of a Value in bytes
+fn estimate_value_size(value: &Value) -> usize {
+    match value {
+        Value::Integer(_) => std::mem::size_of::<i64>(),
+        Value::Varchar(s) => s.capacity(),
+        Value::Boolean(_) => std::mem::size_of::<bool>(),
+        Value::Null => 0,
+    }
 }
 

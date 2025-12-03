@@ -8,11 +8,13 @@ require(['vs/editor/editor.main'], function () {
         base: 'vs',
         inherit: true,
         rules: [
-            { token: 'comment', foreground: '000000', fontStyle: 'bold' },
-            { token: 'keyword', foreground: 'FF6B6B', fontStyle: 'bold' },
-            { token: 'string', foreground: '4ECDC4', fontStyle: 'bold' },
-            { token: 'number', foreground: '95E1D3', fontStyle: 'bold' },
+            { token: 'comment', foreground: '666666', fontStyle: 'bold' },
+            { token: 'keyword', foreground: 'CC0000', fontStyle: 'bold' },
+            { token: 'string', foreground: '006600', fontStyle: 'bold' },
+            { token: 'number', foreground: '0000CC', fontStyle: 'bold' },
             { token: 'operator', foreground: '000000', fontStyle: 'bold' },
+            { token: 'type', foreground: '6600CC', fontStyle: 'bold' },
+            { token: 'identifier', foreground: '000000', fontStyle: 'normal' },
         ],
         colors: {
             'editor.background': '#FFFFFF',
@@ -20,8 +22,9 @@ require(['vs/editor/editor.main'], function () {
             'editor.lineHighlightBackground': '#FFE66D',
             'editor.selectionBackground': '#FF6B6B',
             'editorCursor.foreground': '#000000',
-            'editorLineNumber.foreground': '#000000',
-            'editorLineNumber.activeForeground': '#FF6B6B',
+            'editorLineNumber.foreground': '#666666',
+            'editorLineNumber.activeForeground': '#000000',
+            'editorWhitespace.foreground': '#CCCCCC',
         }
     });
     
@@ -149,9 +152,10 @@ async function executeQuery() {
         
         if (data.success) {
             if (data.result) {
-                displayResults(data.result, executionTime);
+                displayResults(data.result, executionTime, data.from_cache || false);
             } else {
-                showSuccess(`Query executed successfully (no results) - Execution time: ${formatExecutionTime(executionTime)}`);
+                const cacheText = data.from_cache ? ' • Cache used' : '';
+                showSuccess(`Query executed successfully (no results) - Execution time: ${formatExecutionTime(executionTime)}${cacheText}`);
             }
         } else {
             showError(data.error || 'Unknown error occurred');
@@ -161,17 +165,19 @@ async function executeQuery() {
     }
 }
 
-function displayResults(result, executionTime) {
+function displayResults(result, executionTime, fromCache) {
     const resultsContainer = document.getElementById('results-container');
     const MAX_DISPLAY_ROWS = 1000;
     
     if (!result.columns || result.columns.length === 0) {
-        resultsContainer.innerHTML = `<div class="info-message">Query executed successfully (no columns) - Execution time: ${formatExecutionTime(executionTime)}</div>`;
+        const cacheText = fromCache ? ' • Cache used' : '';
+        resultsContainer.innerHTML = `<div class="info-message">Query executed successfully (no columns) - Execution time: ${formatExecutionTime(executionTime)}${cacheText}</div>`;
         return;
     }
     
     if (!result.rows || result.rows.length === 0) {
-        resultsContainer.innerHTML = `<div class="info-message">Query executed successfully (0 rows returned) - Execution time: ${formatExecutionTime(executionTime)}</div>`;
+        const cacheText = fromCache ? ' • Cache used' : '';
+        resultsContainer.innerHTML = `<div class="info-message">Query executed successfully (0 rows returned) - Execution time: ${formatExecutionTime(executionTime)}${cacheText}</div>`;
         return;
     }
     
@@ -181,9 +187,10 @@ function displayResults(result, executionTime) {
     
     let html = '';
     
-    // Show execution time at the top
+    // Show execution time and cache status in a single box
+    const cacheText = fromCache ? ' • Cache used' : '';
     html += `<div class="info-message" style="margin-bottom: 15px;">
-        <strong>⏱️ EXECUTION TIME:</strong> ${formatExecutionTime(executionTime)}
+        <strong>⏱️ EXECUTION TIME:</strong> ${formatExecutionTime(executionTime)}${cacheText}
     </div>`;
     
     // Show warning if results are truncated
@@ -326,16 +333,34 @@ function displayTables(tables) {
     }
     
     let html = '<div class="table-items">';
-    tables.forEach(tableName => {
-        html += `<div class="table-item" data-table="${escapeHtml(tableName)}">${escapeHtml(tableName)}</div>`;
+    tables.forEach(tableInfo => {
+        const tableName = tableInfo.name || tableInfo; // Support both old and new format
+        const rowCount = tableInfo.row_count !== undefined ? tableInfo.row_count : 0;
+        html += `<div class="table-item-wrapper">
+            <div class="table-item" data-table="${escapeHtml(tableName)}">
+                <span class="table-item-name">${escapeHtml(tableName)} <span class="table-row-count">(${rowCount})</span></span>
+                <button class="table-menu-btn" data-table="${escapeHtml(tableName)}" title="Table options">⋯</button>
+            </div>
+            <div class="table-menu" data-table="${escapeHtml(tableName)}">
+                <button class="table-menu-option" data-action="preview" data-table="${escapeHtml(tableName)}">Preview Table</button>
+                <button class="table-menu-option" data-action="insert" data-table="${escapeHtml(tableName)}">Place Table Name</button>
+            </div>
+        </div>`;
     });
     html += '</div>';
     
     tablesList.innerHTML = html;
     
-    // Add click handlers to table items
+    // Add click handlers to table items (only show schema)
     document.querySelectorAll('.table-item').forEach(item => {
-        item.addEventListener('click', function() {
+        item.addEventListener('click', function(e) {
+            // Don't trigger if clicking on menu button or menu
+            if (e.target.classList.contains('table-menu-btn') || 
+                e.target.closest('.table-menu-btn') ||
+                e.target.closest('.table-menu')) {
+                return;
+            }
+            
             const tableName = this.getAttribute('data-table');
             
             // Remove selected class from all table items
@@ -346,16 +371,98 @@ function displayTables(tables) {
             // Add selected class to clicked item
             this.classList.add('selected');
             
-            // Load table schema
+            // Load table schema only
             loadTableSchema(tableName);
-            
-            // Insert SELECT query into editor
-            if (editor) {
-                editor.setValue(`SELECT * FROM ${tableName};`);
-                editor.focus();
-            }
         });
     });
+    
+    // Add click handlers to menu buttons
+    document.querySelectorAll('.table-menu-btn').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            const tableName = this.getAttribute('data-table');
+            toggleTableMenu(tableName);
+        });
+    });
+    
+    // Add click handlers to menu options
+    document.querySelectorAll('.table-menu-option').forEach(option => {
+        option.addEventListener('click', function(e) {
+            e.stopPropagation();
+            const action = this.getAttribute('data-action');
+            const tableName = this.getAttribute('data-table');
+            handleTableMenuAction(action, tableName);
+        });
+    });
+    
+    // Close menus when clicking outside
+    document.addEventListener('click', function(e) {
+        if (!e.target.closest('.table-item-wrapper')) {
+            closeAllTableMenus();
+        }
+    });
+}
+
+// Toggle table menu visibility
+function toggleTableMenu(tableName) {
+    // Close all other menus first
+    closeAllTableMenus();
+    
+    // Toggle the clicked menu (tableName is already escaped in HTML)
+    const menu = document.querySelector(`.table-menu[data-table="${tableName}"]`);
+    if (menu) {
+        menu.classList.toggle('open');
+    }
+}
+
+// Close all table menus
+function closeAllTableMenus() {
+    document.querySelectorAll('.table-menu').forEach(menu => {
+        menu.classList.remove('open');
+    });
+}
+
+// Handle table menu actions
+function handleTableMenuAction(action, tableName) {
+    closeAllTableMenus();
+    
+    if (action === 'preview') {
+        previewTable(tableName);
+    } else if (action === 'insert') {
+        insertTableName(tableName);
+    }
+}
+
+// Preview table (SELECT * FROM table LIMIT 50)
+async function previewTable(tableName) {
+    if (!editor) return;
+    
+    const query = `SELECT * FROM ${tableName} LIMIT 50`;
+    editor.setValue(query);
+    editor.focus();
+    
+    // Execute the query
+    await executeQuery();
+}
+
+// Insert table name at cursor position
+function insertTableName(tableName) {
+    if (!editor) return;
+    
+    const selection = editor.getSelection();
+    const range = new monaco.Range(
+        selection.startLineNumber,
+        selection.startColumn,
+        selection.endLineNumber,
+        selection.endColumn
+    );
+    
+    editor.executeEdits('insert-table-name', [{
+        range: range,
+        text: tableName
+    }]);
+    
+    editor.focus();
 }
 
 // Load table schema from API
@@ -411,6 +518,24 @@ function displayTableSchema(schema) {
     
     html += '</div>';
     
+    // Add storage size information if available
+    if (schema.stats) {
+        const sizeMB = (schema.stats.storage_size_bytes / (1024 * 1024)).toFixed(2);
+        html += `<div class="table-info-storage">
+            <div class="table-info-storage-label">Storage Size:</div>
+            <div class="table-info-storage-value">${sizeMB} MB</div>
+        </div>`;
+    }
+    
     tableInfoContent.innerHTML = html;
+}
+
+// Format bytes to human-readable size
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + sizes[i];
 }
 
