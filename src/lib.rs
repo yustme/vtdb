@@ -116,12 +116,27 @@ impl Database {
     pub fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
         let table = self.catalog.get_table(table_name)?;
         let stats = self.get_table_stats(table_name).ok();
+        let index_manager = self.storage.index_manager();
+        let table_indexes = index_manager.get_table_indexes(table_name);
+        
+        // Create a map of column name to index type
+        let index_map: std::collections::HashMap<String, String> = table_indexes
+            .into_iter()
+            .map(|(col_name, idx_type)| {
+                (col_name, match idx_type {
+                    crate::index::IndexType::Hash => "HASH".to_string(),
+                    crate::index::IndexType::BTree => "BTREE".to_string(),
+                })
+            })
+            .collect();
+        
         Ok(TableSchema {
             name: table.name.clone(),
             columns: table.columns.iter().map(|col| ColumnInfo {
                 name: col.name.clone(),
                 data_type: col.data_type.name().to_string(),
                 ordinal: col.ordinal,
+                index_type: index_map.get(&col.name).cloned(),
             }).collect(),
             stats,
         })
@@ -183,6 +198,8 @@ pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
     pub ordinal: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_type: Option<String>, // "HASH" or "BTREE" if indexed
 }
 
 /// Database value types
@@ -193,6 +210,30 @@ pub enum Value {
     Varchar(String),
     Boolean(bool),
     Null,
+}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+            (Value::Varchar(a), Value::Varchar(b)) => a.cmp(b),
+            (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+            // Ordering: Null < Boolean < Integer < Varchar
+            (Value::Null, _) => std::cmp::Ordering::Less,
+            (_, Value::Null) => std::cmp::Ordering::Greater,
+            (Value::Boolean(_), Value::Integer(_) | Value::Varchar(_)) => std::cmp::Ordering::Less,
+            (Value::Integer(_) | Value::Varchar(_), Value::Boolean(_)) => std::cmp::Ordering::Greater,
+            (Value::Integer(_), Value::Varchar(_)) => std::cmp::Ordering::Less,
+            (Value::Varchar(_), Value::Integer(_)) => std::cmp::Ordering::Greater,
+        }
+    }
 }
 
 impl Value {

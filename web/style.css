@@ -237,6 +237,27 @@ header h1 {
     border: 1px solid #000000;
 }
 
+.index-badge {
+    display: inline-block;
+    font-size: 0.7em;
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-left: 6px;
+    font-weight: bold;
+    text-transform: uppercase;
+    border: 1px solid #000000;
+}
+
+.index-badge.index-hash {
+    background-color: #4ECDC4;
+    color: #000;
+}
+
+.index-badge.index-btree {
+    background-color: #95E1D3;
+    color: #000;
+}
+
 .table-row-count {
     color: #666666;
     font-weight: 600;
@@ -441,6 +462,14 @@ header h1 {
     box-shadow: 1px 1px 0px 0px #000000;
 }
 
+.execute-btn.cancel-mode {
+    background: #FF6B6B;
+}
+
+.execute-btn.cancel-mode:hover {
+    background: #FFE66D;
+}
+
 .editor {
     height: 400px;
     border: 2px solid #000000;
@@ -584,11 +613,42 @@ header h1 {
     font-weight: 700;
     text-transform: uppercase;
     font-size: 1em;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
 }
 
 .loading::after {
     content: '...';
     animation: dots 1.5s steps(4, end) infinite;
+}
+
+.cancel-query-btn {
+    background: #FF6B6B;
+    color: #000000;
+    border: 2px solid #000000;
+    padding: 8px 16px;
+    border-radius: 0;
+    font-size: 0.85em;
+    font-weight: 900;
+    cursor: pointer;
+    transition: all 0.1s;
+    text-transform: uppercase;
+    box-shadow: 2px 2px 0px 0px #000000;
+    font-family: 'Courier New', 'Courier', monospace;
+    margin-top: 10px;
+}
+
+.cancel-query-btn:hover {
+    background: #FFE66D;
+    transform: translate(-1px, -1px);
+    box-shadow: 3px 3px 0px 0px #000000;
+}
+
+.cancel-query-btn:active {
+    transform: translate(1px, 1px);
+    box-shadow: 1px 1px 0px 0px #000000;
 }
 
 @keyframes dots {

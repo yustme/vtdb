@@ -1,15 +1,15 @@
 use crate::Value;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
-/// B-tree index implementation using Rust's BTreeMap
-pub struct BTreeIndex {
-    map: BTreeMap<Value, Vec<usize>>,
+/// Hash index implementation optimized for equality lookups
+pub struct HashIndex {
+    map: HashMap<Value, Vec<usize>>,
 }
 
-impl BTreeIndex {
+impl HashIndex {
     pub fn new() -> Self {
         Self {
-            map: BTreeMap::new(),
+            map: HashMap::new(),
         }
     }
 
@@ -22,16 +22,6 @@ impl BTreeIndex {
     /// Lookup row IDs for an exact key match
     pub fn lookup(&self, key: &Value) -> Vec<usize> {
         self.map.get(key).cloned().unwrap_or_default()
-    }
-
-    /// Range query: find all row IDs where key is between min and max (inclusive)
-    pub fn range_query(&self, min: &Value, max: &Value) -> Vec<usize> {
-        let mut result = Vec::new();
-        use std::ops::Bound;
-        for (_key, row_ids) in self.map.range((Bound::Included(min), Bound::Included(max))) {
-            result.extend(row_ids.iter().cloned());
-        }
-        result
     }
 
     /// Remove a specific row ID for a given key
@@ -60,7 +50,7 @@ impl BTreeIndex {
     }
 }
 
-impl Default for BTreeIndex {
+impl Default for HashIndex {
     fn default() -> Self {
         Self::new()
     }

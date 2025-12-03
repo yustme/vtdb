@@ -5,12 +5,14 @@ pub mod checkpoint;
 
 use anyhow::Result;
 use crate::Value;
+use crate::index::IndexManager;
 use std::collections::HashMap;
 
 /// Storage engine for managing table data
 pub struct StorageEngine {
     tables: HashMap<String, table::Table>,
     wal: wal::WAL,
+    index_manager: IndexManager,
 }
 
 impl StorageEngine {
@@ -18,7 +20,18 @@ impl StorageEngine {
         Self {
             tables: HashMap::new(),
             wal: wal::WAL::new(),
+            index_manager: IndexManager::new(),
         }
+    }
+
+    /// Get reference to index manager
+    pub fn index_manager(&self) -> &IndexManager {
+        &self.index_manager
+    }
+
+    /// Get mutable reference to index manager
+    pub fn index_manager_mut(&mut self) -> &mut IndexManager {
+        &mut self.index_manager
     }
 
     /// Create a new table
@@ -47,7 +60,21 @@ impl StorageEngine {
         
         // Use batch insertion for better performance
         let table = self.get_table(table_name)?;
-        table.insert_rows_batch(rows)?;
+        let start_row_id = table.row_count();
+        table.insert_rows_batch(rows.clone())?;
+        
+        // Maintain indexes efficiently for bulk inserts
+        // For large batches (>1000 rows), defer index updates
+        if rows.len() > 1000 {
+            // Defer: rebuild indexes after insert
+            // For now, we'll still update incrementally but could optimize further
+        }
+        
+        // Update indexes incrementally
+        for (offset, row) in rows.iter().enumerate() {
+            let row_id = start_row_id + offset;
+            self.index_manager.maintain_indexes_on_insert(table_name, row_id, row);
+        }
         
         // Write to WAL once per batch (already optimized - single write per batch)
         // WAL writes are batched at the insert_rows() level, not per-row
@@ -72,8 +99,39 @@ impl StorageEngine {
         predicate: impl Fn(&[Value]) -> bool,
     ) -> Result<usize> {
         let new_value_clone = new_value.clone();
+        
+        // Collect rows that will be updated with their old values for index maintenance (before update)
+        let updates: Vec<(usize, Value)> = {
+            let table = self.tables.get(table_name).ok_or_else(|| {
+                anyhow::anyhow!("Table '{}' not found", table_name)
+            })?;
+            let mut result = Vec::new();
+            for row_idx in 0..table.row_count() {
+                if let Some(row) = table.get_row(row_idx) {
+                    if predicate(&row) {
+                        let old_value = row[column_idx].clone();
+                        result.push((row_idx, old_value));
+                    }
+                }
+            }
+            result
+        };
+        
+        // Perform the update
         let table = self.get_table(table_name)?;
         let updated = table.update_rows(column_idx, new_value, predicate)?;
+        
+        // Maintain indexes: remove old entries and add new entries
+        for (row_id, old_value) in updates {
+            self.index_manager.maintain_indexes_on_update(
+                table_name,
+                column_idx,
+                old_value,
+                new_value_clone.clone(),
+                row_id,
+            );
+        }
+        
         self.wal.append_update(table_name, column_idx, &new_value_clone)?;
         Ok(updated)
     }
@@ -84,8 +142,36 @@ impl StorageEngine {
         table_name: &str,
         predicate: impl Fn(&[Value]) -> bool,
     ) -> Result<usize> {
+        // Collect rows that will be deleted for index maintenance (before delete)
+        let rows_to_delete: Vec<(usize, Vec<Value>)> = {
+            let table = self.tables.get(table_name).ok_or_else(|| {
+                anyhow::anyhow!("Table '{}' not found", table_name)
+            })?;
+            let mut result = Vec::new();
+            for row_idx in 0..table.row_count() {
+                if let Some(row) = table.get_row(row_idx) {
+                    if predicate(&row) {
+                        result.push((row_idx, row));
+                    }
+                }
+            }
+            result
+        };
+        
+        // Perform the delete (this rebuilds the table, so row IDs change)
         let table = self.get_table(table_name)?;
         let deleted = table.delete_rows(predicate)?;
+        
+        // Since delete_rows rebuilds the table, we need to rebuild indexes
+        // Get all remaining rows and rebuild indexes
+        let remaining_rows = {
+            let table_ref = self.tables.get(table_name).ok_or_else(|| {
+                anyhow::anyhow!("Table '{}' not found", table_name)
+            })?;
+            table_ref.scan_all()
+        };
+        self.index_manager.rebuild_indexes_for_table(table_name, &remaining_rows);
+        
         self.wal.append_delete(table_name)?;
         Ok(deleted)
     }

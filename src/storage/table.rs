@@ -150,6 +150,24 @@ impl Table {
         self.row_count
     }
 
+    /// Get a reference to columns (for index maintenance)
+    pub fn get_column_data(&self, column_idx: usize) -> Option<&Vec<Value>> {
+        self.columns.get(column_idx).map(|col| &col.data)
+    }
+
+    /// Get all columns (for index maintenance)
+    pub fn get_columns(&self) -> &Vec<Column> {
+        &self.columns
+    }
+
+    /// Get a row at a specific index
+    pub fn get_row(&self, row_idx: usize) -> Option<Vec<Value>> {
+        if row_idx >= self.row_count {
+            return None;
+        }
+        Some(self.columns.iter().map(|col| col.data[row_idx].clone()).collect())
+    }
+
     /// Estimate the memory size of the table in bytes
     pub fn estimate_size(&self) -> usize {
         let mut size = 0;

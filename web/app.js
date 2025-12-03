@@ -1,4 +1,7 @@
 let editor;
+let currentAbortController = null;
+let executionTimerInterval = null;
+let executionStartTime = null;
 
 // Initialize Monaco Editor
 require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
@@ -43,8 +46,15 @@ require(['vs/editor/editor.main'], function () {
     });
 });
 
-// Execute query
-document.getElementById('execute-btn').addEventListener('click', executeQuery);
+// Execute query button handler
+document.getElementById('execute-btn').addEventListener('click', function() {
+    const executeBtn = document.getElementById('execute-btn');
+    if (executeBtn.classList.contains('cancel-mode')) {
+        cancelQuery();
+    } else {
+        executeQuery();
+    }
+});
 
 // Refresh tables button
 document.getElementById('refresh-tables-btn').addEventListener('click', loadTables);
@@ -123,17 +133,28 @@ function initSidebarResizer() {
 async function executeQuery() {
     const query = editor.getValue();
     const resultsContainer = document.getElementById('results-container');
+    const executeBtn = document.getElementById('execute-btn');
     
     if (!query.trim()) {
         showError('Please enter a SQL query');
         return;
     }
     
-    // Show loading state
-    resultsContainer.innerHTML = '<div class="loading">Executing query</div>';
+    // Cancel any ongoing query
+    if (currentAbortController) {
+        currentAbortController.abort();
+    }
     
-    // Start timing
-    const startTime = performance.now();
+    // Create new abort controller for this query
+    currentAbortController = new AbortController();
+    
+    // Update button to show cancel
+    executeBtn.textContent = 'Cancel Query';
+    executeBtn.classList.add('cancel-mode');
+    
+    // Show loading state with timer
+    executionStartTime = performance.now();
+    startExecutionTimer();
     
     try {
         const response = await fetch('/api/execute', {
@@ -142,13 +163,20 @@ async function executeQuery() {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({ query: query }),
+            signal: currentAbortController.signal,
         });
         
         const data = await response.json();
         
+        // Stop timer
+        stopExecutionTimer();
+        
         // Calculate execution time
         const endTime = performance.now();
-        const executionTime = endTime - startTime;
+        const executionTime = endTime - executionStartTime;
+        
+        // Reset button
+        resetExecuteButton();
         
         if (data.success) {
             if (data.result) {
@@ -161,8 +189,78 @@ async function executeQuery() {
             showError(data.error || 'Unknown error occurred');
         }
     } catch (error) {
-        showError('Failed to execute query: ' + error.message);
+        stopExecutionTimer();
+        resetExecuteButton();
+        
+        if (error.name === 'AbortError') {
+            resultsContainer.innerHTML = '<div class="info-message">Query execution cancelled by user</div>';
+        } else {
+            showError('Failed to execute query: ' + error.message);
+        }
+    } finally {
+        currentAbortController = null;
+        executionStartTime = null;
     }
+}
+
+function cancelQuery() {
+    if (currentAbortController) {
+        currentAbortController.abort();
+    }
+}
+
+function resetExecuteButton() {
+    const executeBtn = document.getElementById('execute-btn');
+    executeBtn.textContent = 'Execute Query';
+    executeBtn.classList.remove('cancel-mode');
+}
+
+function startExecutionTimer() {
+    const resultsContainer = document.getElementById('results-container');
+    
+    // Clear any existing timer
+    if (executionTimerInterval) {
+        clearInterval(executionTimerInterval);
+    }
+    
+    // Update immediately
+    updateExecutionTimer();
+    
+    // Update every 100ms for smooth timer
+    executionTimerInterval = setInterval(() => {
+        updateExecutionTimer();
+    }, 100);
+}
+
+function stopExecutionTimer() {
+    if (executionTimerInterval) {
+        clearInterval(executionTimerInterval);
+        executionTimerInterval = null;
+    }
+}
+
+function updateExecutionTimer() {
+    if (!executionStartTime) return;
+    
+    const resultsContainer = document.getElementById('results-container');
+    const elapsed = performance.now() - executionStartTime;
+    const elapsedFormatted = formatExecutionTime(elapsed);
+    
+    const loadingDiv = document.createElement('div');
+    loadingDiv.className = 'loading';
+    loadingDiv.innerHTML = `
+        <div>Executing query...</div>
+        <div style="margin-top: 8px; font-size: 0.9em;">Running for: ${elapsedFormatted}</div>
+    `;
+    
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'cancel-query-btn';
+    cancelBtn.textContent = 'Cancel Query';
+    cancelBtn.addEventListener('click', cancelQuery);
+    loadingDiv.appendChild(cancelBtn);
+    
+    resultsContainer.innerHTML = '';
+    resultsContainer.appendChild(loadingDiv);
 }
 
 function displayResults(result, executionTime, fromCache) {
@@ -508,7 +606,11 @@ function displayTableSchema(schema) {
     if (schema.columns && schema.columns.length > 0) {
         schema.columns.forEach(column => {
             html += `<div class="table-info-column">`;
-            html += `<span class="table-info-column-name">${escapeHtml(column.name)}</span>`;
+            html += `<span class="table-info-column-name">${escapeHtml(column.name)}`;
+            if (column.index_type) {
+                html += ` <span class="index-badge index-${column.index_type.toLowerCase()}" title="Indexed with ${column.index_type}">[${column.index_type}]</span>`;
+            }
+            html += `</span>`;
             html += `<span class="table-info-column-type">${escapeHtml(column.data_type)}</span>`;
             html += `</div>`;
         });

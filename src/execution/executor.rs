@@ -158,6 +158,12 @@ impl Executor {
         // Create in storage
         storage.create_table(name.to_string(), columns.len())?;
 
+        // Automatically create indexes on all columns (start with hash indexes)
+        let index_manager = storage.index_manager_mut();
+        for (col_idx, (col_name, _)) in columns.iter().enumerate() {
+            index_manager.create_index(name, col_name, col_idx, crate::index::IndexType::Hash);
+        }
+
         Ok(QueryResult {
             rows: Vec::new(),
             columns: Vec::new(),
@@ -174,8 +180,30 @@ impl Executor {
         storage: &StorageEngine,
         catalog: &Catalog,
     ) -> Result<QueryResult> {
-        // Execute JOINs or single table scan
-        let (all_rows, combined_schema) = self.execute_table_ref(from, storage, catalog)?;
+        // Try to use index scan for single table queries with filters
+        let (all_rows, combined_schema) = match (from, filter) {
+            (crate::parser::ast::TableRef::Table { name, alias }, Some(filter_expr)) => {
+                // Check if we can use an index
+                if let Some((column_name, key_value)) = self.extract_equality_predicate(filter_expr) {
+                    // Try to use index for equality lookup
+                    use crate::execution::operators::IndexScan;
+                    let row_ids = IndexScan::scan_by_key(name, &column_name, key_value, storage)?;
+                    if !row_ids.is_empty() {
+                        // Use index scan
+                        let rows = IndexScan::get_rows_by_ids(name, &row_ids, storage)?;
+                        let schema = catalog.get_table(name)?;
+                        let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
+                        return self.finish_select_execution(rows, &combined_schema, columns, filter, group_by, limit);
+                    }
+                }
+                // Fall back to regular scan
+                self.execute_table_ref(from, storage, catalog)?
+            }
+            _ => {
+                // Execute JOINs or single table scan without filter
+                self.execute_table_ref(from, storage, catalog)?
+            }
+        };
 
         // Apply filter
         let filtered_rows = if let Some(filter_expr) = filter {
@@ -188,6 +216,20 @@ impl Executor {
         } else {
             all_rows
         };
+
+        self.finish_select_execution(filtered_rows, &combined_schema, columns, filter, group_by, limit)
+    }
+
+    /// Finish SELECT execution (common code for both index and table scans)
+    fn finish_select_execution(
+        &self,
+        filtered_rows: Vec<Vec<Value>>,
+        combined_schema: &CombinedSchema,
+        columns: &[crate::parser::ast::SelectItem],
+        filter: &Option<crate::parser::ast::Expr>,
+        group_by: &Option<Vec<String>>,
+        limit: &Option<u64>,
+    ) -> Result<QueryResult> {
 
         // Check if we have aggregate functions
         let has_aggregates = columns.iter().any(|item| {
@@ -223,6 +265,34 @@ impl Executor {
         })
     }
 
+    /// Extract equality predicate (column = value) for index lookup
+    fn extract_equality_predicate(&self, expr: &crate::parser::ast::Expr) -> Option<(String, Value)> {
+        match expr {
+            crate::parser::ast::Expr::BinaryOp { left, op, right } => {
+                if *op == crate::parser::ast::BinaryOperator::Eq {
+                    match (left.as_ref(), right.as_ref()) {
+                        (crate::parser::ast::Expr::Column(col), crate::parser::ast::Expr::Literal(val)) => {
+                            Some((col.clone(), val.clone()))
+                        }
+                        (crate::parser::ast::Expr::QualifiedColumn { table: _, column }, crate::parser::ast::Expr::Literal(val)) => {
+                            Some((column.clone(), val.clone()))
+                        }
+                        (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::Column(col)) => {
+                            Some((col.clone(), val.clone()))
+                        }
+                        (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::QualifiedColumn { table: _, column }) => {
+                            Some((column.clone(), val.clone()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Execute a TableRef (table or JOIN) and return rows with combined schema
     fn execute_table_ref(
         &self,
@@ -233,6 +303,8 @@ impl Executor {
         match table_ref {
             crate::parser::ast::TableRef::Table { name, alias } => {
                 let schema = catalog.get_table(name)?;
+                // Try to use index scan if filter is present and indexable
+                // For now, we'll scan all rows - index optimization will be added in execute_select
                 let rows = storage.scan_table(name)?;
                 let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
                 Ok((rows, combined_schema))
@@ -764,7 +836,8 @@ fn compute_aggregate(
             // Return NULL if all values were NULL (Snowflake behavior)
             Ok(max_val.unwrap_or(Value::Null))
         }
-    };
+    }
+}
 
 impl Executor {
     /// Inner JOIN implementation  
@@ -1867,5 +1940,4 @@ impl Executor {
             }
         }
     }
-}
 }
