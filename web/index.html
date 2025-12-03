@@ -27,45 +27,23 @@
                 </div>
             </div>
             
-            <div class="query-section">
-                <div class="query-header">
-                    <h2>SQL Query</h2>
-                    <button id="execute-btn" class="execute-btn">Execute Query</button>
+            <div class="query-results-column">
+                <div class="query-section">
+                    <div class="query-header">
+                        <h2>SQL Query</h2>
+                        <button id="execute-btn" class="execute-btn">Execute Query</button>
+                    </div>
+                    <div id="editor" class="editor"></div>
                 </div>
-                <div id="editor" class="editor"></div>
-            </div>
-            
-            <div class="results-section">
-                <h2>Results</h2>
-                <div id="results-container">
-                    <div class="empty-state">
-                        <p>Enter a SQL query and click "Execute Query" to see results</p>
+                
+                <div class="results-section">
+                    <h2>Results</h2>
+                    <div id="results-container">
+                        <div class="empty-state">
+                            <p>Enter a SQL query and click "Execute Query" to see results</p>
+                        </div>
                     </div>
                 </div>
-            </div>
-        </div>
-        
-        <div class="examples-section">
-            <h3>Example Queries</h3>
-            <div class="example-queries">
-                <button class="example-btn" onclick="loadExample('CREATE TABLE users (id INTEGER, name VARCHAR)')">
-                    CREATE TABLE
-                </button>
-                <button class="example-btn" onclick="loadExample('INSERT INTO users VALUES (1, \\'Alice\\')')">
-                    INSERT
-                </button>
-                <button class="example-btn" onclick="loadExample('SELECT * FROM users')">
-                    SELECT ALL
-                </button>
-                <button class="example-btn" onclick="loadExample('SELECT name FROM users WHERE id = 1')">
-                    SELECT WITH WHERE
-                </button>
-                <button class="example-btn" onclick="loadExample('UPDATE users SET name = \\'Bob Updated\\' WHERE id = 1')">
-                    UPDATE
-                </button>
-                <button class="example-btn" onclick="loadExample('DELETE FROM users WHERE id = 1')">
-                    DELETE
-                </button>
             </div>
         </div>
     </div>

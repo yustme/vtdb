@@ -35,15 +35,23 @@ impl StorageEngine {
         })
     }
 
-    /// Insert rows into a table
+    /// Insert rows into a table using optimized batch insertion
     pub fn insert_rows(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<()> {
-        let rows_clone = rows.clone();
-        let table = self.get_table(table_name)?;
-        for row in rows {
-            table.insert_row(row)?;
+        if rows.is_empty() {
+            return Ok(());
         }
-        // Write to WAL
-        self.wal.append_insert(table_name, rows_clone)?;
+
+        // Clone rows for WAL before batch insertion (WAL needs to own the data)
+        // This clone is necessary for durability - WAL must have its own copy
+        let rows_for_wal = rows.clone();
+        
+        // Use batch insertion for better performance
+        let table = self.get_table(table_name)?;
+        table.insert_rows_batch(rows)?;
+        
+        // Write to WAL once per batch (already optimized - single write per batch)
+        // WAL writes are batched at the insert_rows() level, not per-row
+        self.wal.append_insert(table_name, rows_for_wal)?;
         Ok(())
     }
 

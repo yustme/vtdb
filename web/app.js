@@ -98,6 +98,7 @@ async function executeQuery() {
 
 function displayResults(result) {
     const resultsContainer = document.getElementById('results-container');
+    const MAX_DISPLAY_ROWS = 1000;
     
     if (!result.columns || result.columns.length === 0) {
         resultsContainer.innerHTML = '<div class="info-message">Query executed successfully (no columns)</div>';
@@ -109,7 +110,20 @@ function displayResults(result) {
         return;
     }
     
-    let html = '<table class="results-table"><thead><tr>';
+    const totalRows = result.rows.length;
+    const rowsToDisplay = result.rows.slice(0, MAX_DISPLAY_ROWS);
+    const isTruncated = totalRows > MAX_DISPLAY_ROWS;
+    
+    let html = '';
+    
+    // Show warning if results are truncated
+    if (isTruncated) {
+        html += `<div class="info-message" style="margin-bottom: 15px;">
+            <strong>⚠️ LARGE RESULT SET:</strong> Query returned ${totalRows} row(s), but only the first ${MAX_DISPLAY_ROWS} row(s) are displayed to prevent UI performance issues.
+        </div>`;
+    }
+    
+    html += '<table class="results-table"><thead><tr>';
     
     // Header row
     result.columns.forEach(column => {
@@ -117,8 +131,8 @@ function displayResults(result) {
     });
     html += '</tr></thead><tbody>';
     
-    // Data rows
-    result.rows.forEach(row => {
+    // Data rows (limited to MAX_DISPLAY_ROWS)
+    rowsToDisplay.forEach(row => {
         html += '<tr>';
         row.forEach(cell => {
             const value = formatValue(cell);
@@ -130,7 +144,13 @@ function displayResults(result) {
     html += '</tbody></table>';
     
     // Add row count info
-    html += `<div class="info-message" style="margin-top: 10px;">${result.rows.length} row(s) returned</div>`;
+    if (isTruncated) {
+        html += `<div class="info-message" style="margin-top: 15px;">
+            Showing ${MAX_DISPLAY_ROWS} of ${totalRows} row(s) returned
+        </div>`;
+    } else {
+        html += `<div class="info-message" style="margin-top: 15px;">${totalRows} row(s) returned</div>`;
+    }
     
     resultsContainer.innerHTML = html;
 }
@@ -172,13 +192,6 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
-}
-
-function loadExample(query) {
-    if (editor) {
-        editor.setValue(query);
-        editor.focus();
-    }
 }
 
 // Load tables from API

@@ -8,17 +8,21 @@ body {
     font-family: 'Courier New', 'Courier', monospace;
     background: #FFE66D;
     min-height: 100vh;
-    padding: 20px;
+    padding: 0;
+    margin: 0;
 }
 
 .container {
-    max-width: 1400px;
-    margin: 0 auto;
+    width: 100%;
+    margin: 0;
     background: #FFFFFF;
-    border: 5px solid #000000;
+    border: none;
     border-radius: 0;
     overflow: hidden;
-    box-shadow: 8px 8px 0px 0px #000000;
+    box-shadow: none;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
 }
 
 header {
@@ -45,27 +49,39 @@ header h1 {
 
 .main-content {
     display: grid;
-    grid-template-columns: 250px 1fr 1fr;
+    grid-template-columns: 250px 1fr;
     gap: 0;
     padding: 0;
+    flex: 1;
+    min-height: 0;
 }
 
-.sidebar, .query-section, .results-section {
+.sidebar {
     display: flex;
     flex-direction: column;
     border-right: 5px solid #000000;
 }
 
-.sidebar:last-child, .query-section:last-child, .results-section:last-child {
-    border-right: none;
+.query-results-column {
+    display: flex;
+    flex-direction: column;
+}
+
+.query-section, .results-section {
+    display: flex;
+    flex-direction: column;
+}
+
+.query-section {
+    border-bottom: 5px solid #000000;
 }
 
 .sidebar {
     background: #4ECDC4;
     border-right: 5px solid #000000;
     padding: 20px;
-    min-height: 400px;
-    max-height: 600px;
+    height: 100%;
+    min-height: 0;
 }
 
 .sidebar-header {
@@ -321,51 +337,6 @@ header h1 {
     box-shadow: 4px 4px 0px 0px #000000;
 }
 
-.examples-section {
-    padding: 25px;
-    background: #FFE66D;
-    border-top: 5px solid #000000;
-}
-
-.examples-section h3 {
-    margin-bottom: 20px;
-    color: #000000;
-    font-weight: 900;
-    font-size: 1.5em;
-    text-transform: uppercase;
-}
-
-.example-queries {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 15px;
-}
-
-.example-btn {
-    background: #FFFFFF;
-    border: 4px solid #000000;
-    color: #000000;
-    padding: 12px 20px;
-    border-radius: 0;
-    cursor: pointer;
-    font-size: 0.9em;
-    transition: all 0.1s;
-    font-weight: 700;
-    text-transform: uppercase;
-    box-shadow: 4px 4px 0px 0px #000000;
-    font-family: 'Courier New', 'Courier', monospace;
-}
-
-.example-btn:hover {
-    background: #FF6B6B;
-    transform: translate(-2px, -2px);
-    box-shadow: 6px 6px 0px 0px #000000;
-}
-
-.example-btn:active {
-    transform: translate(2px, 2px);
-    box-shadow: 2px 2px 0px 0px #000000;
-}
 
 .loading {
     text-align: center;
@@ -392,17 +363,14 @@ header h1 {
         grid-template-columns: 1fr;
     }
     
-    .sidebar, .query-section, .results-section {
+    .sidebar {
         border-right: none;
         border-bottom: 5px solid #000000;
+        min-height: 300px;
     }
     
-    .sidebar:last-child, .query-section:last-child, .results-section:last-child {
-        border-bottom: none;
-    }
-    
-    .sidebar {
-        max-height: 300px;
+    .query-section {
+        border-bottom: 5px solid #000000;
     }
 }
 

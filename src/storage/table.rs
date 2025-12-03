@@ -43,6 +43,52 @@ impl Table {
         Ok(())
     }
 
+    /// Insert multiple rows efficiently using columnar batch insertion
+    /// This method is optimized for batch inserts and avoids per-row overhead
+    pub fn insert_rows_batch(&mut self, rows: Vec<Vec<Value>>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let row_count = rows.len();
+        let expected_columns = self.columns.len();
+
+        // Validate all rows have correct column count (single validation for entire batch)
+        for (idx, row) in rows.iter().enumerate() {
+            if row.len() != expected_columns {
+                return Err(anyhow::anyhow!(
+                    "Row {} has {} columns, but table has {} columns",
+                    idx,
+                    row.len(),
+                    expected_columns
+                ));
+            }
+        }
+
+        // Pre-allocate capacity for all columns to avoid reallocations
+        for col in &mut self.columns {
+            col.data.reserve(row_count);
+        }
+
+        // Perform columnar batch insertion: extract values column by column
+        // Note: We clone values here because we need to iterate over rows multiple times
+        // (once per column). This is still more efficient than row-by-row insertion
+        // because we pre-allocate and use extend() for bulk operations.
+        for col_idx in 0..expected_columns {
+            // Extract all values for this column from all rows
+            let column_values: Vec<Value> = rows.iter()
+                .map(|row| row[col_idx].clone())
+                .collect();
+            
+            // Extend the column vector with all values at once (more efficient than multiple pushes)
+            self.columns[col_idx].data.extend(column_values);
+        }
+
+        // Update row count
+        self.row_count += row_count;
+        Ok(())
+    }
+
     pub fn scan_all(&self) -> Vec<Vec<Value>> {
         let mut rows = Vec::with_capacity(self.row_count);
         for row_idx in 0..self.row_count {
