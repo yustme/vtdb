@@ -50,6 +50,8 @@ pub struct QueryProgressTracker {
     pub current_stage: String,
     pub rows_processed: usize,
     pub estimated_total_rows: usize,
+    pub rows_joined: usize,
+    pub rows_aggregated: usize,
     #[serde(skip_serializing)]
     pub start_time: Instant,
     pub error_message: Option<String>,
@@ -66,6 +68,8 @@ impl QueryProgressTracker {
             current_stage: "Initializing".to_string(),
             rows_processed: 0,
             estimated_total_rows: 0,
+            rows_joined: 0,
+            rows_aggregated: 0,
             start_time: Instant::now(),
             error_message: None,
             elapsed_seconds: 0.0,
@@ -98,6 +102,14 @@ impl QueryProgressTracker {
             return 0.0;
         }
         (self.rows_processed as f64 / self.estimated_total_rows as f64 * 100.0).min(100.0)
+    }
+
+    pub fn update_rows_joined(&mut self, rows_joined: usize) {
+        self.rows_joined = rows_joined;
+    }
+
+    pub fn update_rows_aggregated(&mut self, rows_aggregated: usize) {
+        self.rows_aggregated = rows_aggregated;
     }
 }
 
@@ -517,7 +529,7 @@ async fn execute_query_with_progress(
             db.clone(),
             Some(active_queries_clone),
             Some(&query_id),
-        )?
+        ).await?
     } else {
         // Fall back to regular execution for non-SELECT queries
         let executor = {
@@ -577,8 +589,8 @@ fn update_progress_stage(db: &Arc<Mutex<Database>>, query_id: &str, stage: Strin
     }
 }
 
-/// Helper function to execute with progress, avoiding borrow checker issues
-fn execute_with_progress_helper(
+/// Helper function to execute with progress, avoiding borrow checker issues (async)
+async fn execute_with_progress_helper(
     executor: &Executor,
     plan: &crate::planner::physical::PhysicalPlan,
     db: Arc<Mutex<Database>>,
@@ -588,16 +600,23 @@ fn execute_with_progress_helper(
     // Lock database and extract storage and catalog references
     // We need to use unsafe to get mutable references to both fields
     // This is safe because storage and catalog don't overlap in memory
-    let mut db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
-    
-    // Use unsafe to get mutable references to both fields
-    // This is safe because we're not aliasing and the references don't overlap
-    let storage_ptr: *mut StorageEngine = &mut db_guard.storage;
-    let catalog_ptr: *mut Catalog = &mut db_guard.catalog;
+    // IMPORTANT: We must drop the guard before any await to avoid Send issues
+    let (storage_ptr, catalog_ptr) = {
+        let mut db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
+        
+        // Use unsafe to get mutable references to both fields
+        // This is safe because we're not aliasing and the references don't overlap
+        let storage_ptr: *mut StorageEngine = &mut db_guard.storage;
+        let catalog_ptr: *mut Catalog = &mut db_guard.catalog;
+        
+        // Convert to raw pointers and drop the guard before await
+        (storage_ptr, catalog_ptr)
+    };
     
     // Execute with the raw pointers converted back to references
     // This avoids the borrow checker issue
     // SAFETY: storage and catalog are separate fields, so these pointers don't alias
+    // The guard has been dropped, so this is safe across await points
     unsafe {
         Ok(executor.execute_with_progress(
             plan,
@@ -605,7 +624,7 @@ fn execute_with_progress_helper(
             &mut *catalog_ptr,
             active_queries,
             query_id,
-        )?)
+        ).await?)
     }
 }
 

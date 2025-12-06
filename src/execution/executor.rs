@@ -120,18 +120,31 @@ impl Executor {
         Self {}
     }
 
-    /// Execute a physical plan
+    /// Execute a physical plan (synchronous wrapper for async execution)
     pub fn execute(
         &self,
         plan: &PhysicalPlan,
         storage: &mut StorageEngine,
         catalog: &mut Catalog,
     ) -> Result<QueryResult> {
-        self.execute_with_progress(plan, storage, catalog, None, None)
+        // For synchronous execution, use a simple runtime handle
+        // This will work if we're already in an async context, otherwise it will block
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            // We're in an async context, but execute is synchronous
+            // Use block_in_place to run async code
+            tokio::task::block_in_place(|| {
+                handle.block_on(self.execute_with_progress(plan, storage, catalog, None, None))
+            })
+        } else {
+            // Not in async context, create a temporary runtime
+            let rt = tokio::runtime::Runtime::new().map_err(|e| anyhow::anyhow!("Failed to create runtime: {}", e))?;
+            rt.block_on(self.execute_with_progress(plan, storage, catalog, None, None))
+        }
     }
 
-    /// Execute with optional progress tracking
-    pub fn execute_with_progress(
+    /// Execute with optional progress tracking (async)
+    pub async fn execute_with_progress(
         &self,
         plan: &PhysicalPlan,
         storage: &mut StorageEngine,
@@ -144,7 +157,7 @@ impl Executor {
                 self.execute_create_table(name, columns, storage, catalog)
             }
             PhysicalPlan::Select { from, columns, filter, group_by, limit } => {
-                self.execute_select_with_progress(from, columns, filter, group_by, limit, storage, catalog, active_queries, query_id)
+                self.execute_select_with_progress(from, columns, filter, group_by, limit, storage, catalog, active_queries, query_id).await
             }
             PhysicalPlan::Insert { table, columns, values } => {
                 self.execute_insert(table, columns, values, storage, catalog)
@@ -216,7 +229,7 @@ impl Executor {
                         let rows = IndexScan::get_rows_by_ids(name, &row_ids, storage)?;
                         let schema = catalog.get_table(name)?;
                         let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
-                        return self.finish_select_execution(rows, &combined_schema, columns, filter, group_by, limit);
+                        return self.finish_select_execution_sync(rows, &combined_schema, columns, filter, group_by, limit);
                     }
                 }
                 // Fall back to regular scan
@@ -240,11 +253,11 @@ impl Executor {
             all_rows
         };
 
-        self.finish_select_execution(filtered_rows, &combined_schema, columns, filter, group_by, limit)
+        self.finish_select_execution_sync(filtered_rows, &combined_schema, columns, filter, group_by, limit)
     }
 
     /// Execute SELECT query with progress tracking (public method)
-    pub fn execute_select_with_progress_direct(
+    pub async fn execute_select_with_progress_direct(
         &self,
         plan: &PhysicalPlan,
         storage: &mut StorageEngine,
@@ -254,14 +267,14 @@ impl Executor {
     ) -> Result<QueryResult> {
         match plan {
             PhysicalPlan::Select { from, columns, filter, group_by, limit } => {
-                self.execute_select_with_progress(from, columns, filter, group_by, limit, storage, catalog, active_queries, query_id)
+                self.execute_select_with_progress(from, columns, filter, group_by, limit, storage, catalog, active_queries, query_id).await
             }
             _ => Err(anyhow::anyhow!("This method only supports SELECT queries"))
         }
     }
 
-    /// Execute SELECT with progress tracking
-    fn execute_select_with_progress(
+    /// Execute SELECT with progress tracking (async)
+    async fn execute_select_with_progress(
         &self,
         from: &crate::parser::ast::TableRef,
         columns: &[crate::parser::ast::SelectItem],
@@ -302,15 +315,15 @@ impl Executor {
                         let rows = IndexScan::get_rows_by_ids(name, &row_ids, storage)?;
                         let schema = catalog.get_table(name)?;
                         let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
-                        return self.finish_select_execution(rows, &combined_schema, columns, filter, group_by, limit);
+                        return self.finish_select_execution(rows, &combined_schema, columns, filter, group_by, limit, Some(&active_queries), Some(query_id)).await;
                     }
                 }
                 // Fall back to chunked scan
-                self.execute_table_ref_with_progress(from, storage, catalog, &active_queries, query_id, CHUNK_SIZE)?
+                self.execute_table_ref_with_progress(from, storage, catalog, &active_queries, query_id, CHUNK_SIZE).await?
             }
             _ => {
                 // Execute JOINs or single table scan with progress
-                self.execute_table_ref_with_progress(from, storage, catalog, &active_queries, query_id, CHUNK_SIZE)?
+                self.execute_table_ref_with_progress(from, storage, catalog, &active_queries, query_id, CHUNK_SIZE).await?
             }
         };
 
@@ -326,11 +339,32 @@ impl Executor {
             all_rows
         };
 
-        self.finish_select_execution(filtered_rows, &combined_schema, columns, filter, group_by, limit)
+        self.finish_select_execution_sync(filtered_rows, &combined_schema, columns, filter, group_by, limit)
     }
 
-    /// Finish SELECT execution (common code for both index and table scans)
-    fn finish_select_execution(
+    /// Finish SELECT execution synchronously (wrapper for async version)
+    fn finish_select_execution_sync(
+        &self,
+        filtered_rows: Vec<Vec<Value>>,
+        combined_schema: &CombinedSchema,
+        columns: &[crate::parser::ast::SelectItem],
+        filter: &Option<crate::parser::ast::Expr>,
+        group_by: &Option<Vec<String>>,
+        limit: &Option<u64>,
+    ) -> Result<QueryResult> {
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            tokio::task::block_in_place(|| {
+                handle.block_on(self.finish_select_execution(filtered_rows, combined_schema, columns, filter, group_by, limit, None, None))
+            })
+        } else {
+            let rt = tokio::runtime::Runtime::new().map_err(|e| anyhow::anyhow!("Failed to create runtime: {}", e))?;
+            rt.block_on(self.finish_select_execution(filtered_rows, combined_schema, columns, filter, group_by, limit, None, None))
+        }
+    }
+
+    /// Finish SELECT execution (common code for both index and table scans) (async)
+    async fn finish_select_execution(
         &self,
         filtered_rows: Vec<Vec<Value>>,
         combined_schema: &CombinedSchema,
@@ -338,6 +372,8 @@ impl Executor {
         _filter: &Option<crate::parser::ast::Expr>,
         group_by: &Option<Vec<String>>,
         limit: &Option<u64>,
+        active_queries: Option<&Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>>,
+        query_id: Option<&str>,
     ) -> Result<QueryResult> {
 
         // Check if we have aggregate functions
@@ -353,7 +389,9 @@ impl Executor {
                 columns,
                 group_by,
                 limit,
-            );
+                active_queries,
+                query_id,
+            ).await;
         }
 
         // Apply LIMIT (Snowflake LIMIT behavior: limit the number of rows returned)
@@ -424,8 +462,9 @@ impl Executor {
         }
     }
 
-    /// Execute a TableRef with progress tracking using chunked scans
-    fn execute_table_ref_with_progress(
+    /// Execute a TableRef with progress tracking using chunked scans (async)
+    #[async_recursion::async_recursion]
+    async fn execute_table_ref_with_progress(
         &self,
         table_ref: &crate::parser::ast::TableRef,
         storage: &mut StorageEngine,
@@ -455,14 +494,8 @@ impl Executor {
                 let mut start_idx = 0;
                 
                 while start_idx < total_rows {
-                    // Check if query was cancelled
-                    if let Ok(queries) = active_queries.lock() {
-                        if let Some(tracker) = queries.get(query_id) {
-                            if tracker.status == crate::QueryStatus::Cancelled {
-                                return Err(anyhow::anyhow!("Query cancelled"));
-                            }
-                        }
-                    }
+                    // Check if query was cancelled (async)
+                    Self::check_cancellation(active_queries, query_id).await?;
 
                     // Scan chunk
                     let chunk = storage.scan_table_chunk(name, start_idx, chunk_size)?;
@@ -477,8 +510,8 @@ impl Executor {
                         }
                     }
 
-                    // Yield to other tasks periodically (every chunk)
-                    std::thread::yield_now();
+                    // Yield to other tasks periodically (every chunk) - async cooperative
+                    tokio::task::yield_now().await;
                 }
 
                 let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
@@ -486,32 +519,43 @@ impl Executor {
             }
             crate::parser::ast::TableRef::Join { left, right, join_type, condition } => {
                 // For JOINs, recursively scan with progress
+                // Process left side first
                 let (left_rows, left_schema) = self.execute_table_ref_with_progress(
                     left, storage, catalog, active_queries, query_id, chunk_size
-                )?;
+                ).await?;
+                
+                // Then process right side
                 let (right_rows, right_schema) = self.execute_table_ref_with_progress(
                     right, storage, catalog, active_queries, query_id, chunk_size
-                )?;
+                ).await?;
                 
                 // Combine schemas
                 let combined_schema = CombinedSchema::from_join(&left_schema, &right_schema)?;
                 
-                // Perform JOIN
+                // Update progress: Joining tables
+                if let Ok(mut queries) = active_queries.lock() {
+                    if let Some(tracker) = queries.get_mut(query_id) {
+                        tracker.set_stage(format!("Joining tables ({} left rows, {} right rows)", left_rows.len(), right_rows.len()));
+                        tracker.estimated_total_rows = left_rows.len().max(right_rows.len());
+                    }
+                }
+                
+                // Perform JOIN with progress tracking
                 let joined_rows = match join_type {
                     crate::parser::ast::JoinType::Inner => {
-                        self.inner_join(&left_rows, &right_rows, condition, &left_schema, &right_schema)?
+                        self.inner_join_with_progress(&left_rows, &right_rows, condition, &left_schema, &right_schema, active_queries, query_id).await?
                     }
                     crate::parser::ast::JoinType::Left => {
-                        self.left_join(&left_rows, &right_rows, condition, &left_schema, &right_schema)?
+                        self.left_join_with_progress(&left_rows, &right_rows, condition, &left_schema, &right_schema, active_queries, query_id).await?
                     }
                     crate::parser::ast::JoinType::Right => {
-                        self.right_join(&left_rows, &right_rows, condition, &left_schema, &right_schema)?
+                        self.right_join_with_progress(&left_rows, &right_rows, condition, &left_schema, &right_schema, active_queries, query_id).await?
                     }
                     crate::parser::ast::JoinType::FullOuter => {
-                        self.full_outer_join(&left_rows, &right_rows, condition, &left_schema, &right_schema)?
+                        self.full_outer_join_with_progress(&left_rows, &right_rows, condition, &left_schema, &right_schema, active_queries, query_id).await?
                     }
                     crate::parser::ast::JoinType::Cross => {
-                        self.cross_join(&left_rows, &right_rows)?
+                        self.cross_join_with_progress(&left_rows, &right_rows, active_queries, query_id).await?
                     }
                 };
                 
@@ -1555,6 +1599,585 @@ impl Executor {
         Ok(result)
     }
 
+    /// Helper to check if query was cancelled
+    async fn check_cancellation(
+        active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
+        query_id: &str,
+    ) -> Result<()> {
+        if let Ok(queries) = active_queries.lock() {
+            if let Some(tracker) = queries.get(query_id) {
+                if tracker.status == crate::QueryStatus::Cancelled {
+                    return Err(anyhow::anyhow!("Query cancelled"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper to update JOIN progress
+    fn update_join_progress(
+        active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
+        query_id: &str,
+        rows_joined: usize,
+    ) {
+        if let Ok(mut queries) = active_queries.lock() {
+            if let Some(tracker) = queries.get_mut(query_id) {
+                tracker.update_rows_joined(rows_joined);
+                tracker.rows_processed = rows_joined;
+            }
+        }
+    }
+
+    /// Inner JOIN with progress tracking
+    async fn inner_join_with_progress(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_rows: &[Vec<Value>],
+        condition: &Option<crate::parser::ast::JoinCondition>,
+        left_schema: &CombinedSchema,
+        right_schema: &CombinedSchema,
+        active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
+        query_id: &str,
+    ) -> Result<Vec<Vec<Value>>> {
+        const PROGRESS_CHECK_INTERVAL: usize = 1000;
+        let mut rows_joined = 0;
+
+        match condition {
+            Some(crate::parser::ast::JoinCondition::On(expr)) => {
+                // Try hash join for equi-joins
+                if let Some(key_info) = self.extract_equi_join_keys(expr, left_schema, right_schema) {
+                    // Use hash join for equi-join with progress tracking
+                    let mut result = Vec::new();
+                    let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                    
+                    for (idx, left_row) in left_rows.iter().enumerate() {
+                        // Check cancellation periodically
+                        if idx % PROGRESS_CHECK_INTERVAL == 0 {
+                            Self::check_cancellation(active_queries, query_id).await?;
+                            Self::update_join_progress(active_queries, query_id, rows_joined);
+                            tokio::task::yield_now().await;
+                        }
+
+                        let left_key: Vec<Value> = key_info.left_indices.iter().map(|&i| left_row[i].clone()).collect();
+                        if let Some(right_indices) = hash_table.get(&left_key) {
+                            for &right_idx in right_indices {
+                                let right_row = &right_rows[right_idx];
+                                let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                                result.push(combined_row);
+                                rows_joined += 1;
+                            }
+                        }
+                    }
+                    Self::update_join_progress(active_queries, query_id, rows_joined);
+                    return Ok(result);
+                }
+                
+                // Fall back to nested loop for complex conditions
+                let mut result = Vec::new();
+                let estimated_size = left_rows.len().min(right_rows.len());
+                result.reserve(estimated_size);
+                
+                for (left_idx, left_row) in left_rows.iter().enumerate() {
+                    // Check cancellation periodically
+                    if left_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                        Self::check_cancellation(active_queries, query_id).await?;
+                        Self::update_join_progress(active_queries, query_id, rows_joined);
+                        tokio::task::yield_now().await;
+                    }
+
+                    for right_row in right_rows {
+                        let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                        if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
+                            result.push(combined_row);
+                            rows_joined += 1;
+                        }
+                    }
+                }
+                Self::update_join_progress(active_queries, query_id, rows_joined);
+                Ok(result)
+            }
+            Some(crate::parser::ast::JoinCondition::Using(columns)) => {
+                // USING clause - equi-join, use hash join
+                let mut left_indices = Vec::new();
+                let mut right_indices = Vec::new();
+                for col_name in columns {
+                    left_indices.push(left_schema.find_column(None, col_name)?);
+                    right_indices.push(right_schema.find_column(None, col_name)?);
+                }
+                
+                let key_info = JoinKeyInfo {
+                    left_indices,
+                    right_indices,
+                };
+                
+                let mut result = self.hash_join_equi(left_rows, right_rows, &key_info);
+                rows_joined = result.len();
+                Self::update_join_progress(active_queries, query_id, rows_joined);
+                
+                // For USING, deduplicate columns
+                let mut right_skip_indices = std::collections::HashSet::new();
+                for col_name in columns {
+                    if let Ok(idx) = right_schema.find_column(None, col_name) {
+                        right_skip_indices.insert(idx);
+                    }
+                }
+                
+                let mut deduplicated_result = Vec::new();
+                for row in result {
+                    let left_col_count = left_rows.first().map(|r| r.len()).unwrap_or(0);
+                    let mut new_row = Vec::with_capacity(left_col_count + right_rows.first().map(|r| r.len() - right_skip_indices.len()).unwrap_or(0));
+                    new_row.extend_from_slice(&row[..left_col_count]);
+                    for (idx, val) in row[left_col_count..].iter().enumerate() {
+                        if !right_skip_indices.contains(&idx) {
+                            new_row.push(val.clone());
+                        }
+                    }
+                    deduplicated_result.push(new_row);
+                }
+                
+                Ok(deduplicated_result)
+            }
+            None => {
+                // CROSS JOIN
+                self.cross_join_with_progress(left_rows, right_rows, active_queries, query_id).await
+            }
+        }
+    }
+
+    /// LEFT JOIN with progress tracking
+    async fn left_join_with_progress(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_rows: &[Vec<Value>],
+        condition: &Option<crate::parser::ast::JoinCondition>,
+        left_schema: &CombinedSchema,
+        right_schema: &CombinedSchema,
+        active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
+        query_id: &str,
+    ) -> Result<Vec<Vec<Value>>> {
+        const PROGRESS_CHECK_INTERVAL: usize = 1000;
+        use std::collections::HashSet;
+        
+        let right_null_row: Vec<Value> = vec![Value::Null; right_schema.columns.len()];
+        let mut result = Vec::new();
+        let mut matched_left_indices = HashSet::new();
+        let mut rows_joined = 0;
+
+        match condition {
+            Some(crate::parser::ast::JoinCondition::On(expr)) => {
+                if let Some(key_info) = self.extract_equi_join_keys(expr, left_schema, right_schema) {
+                    let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                    
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        if left_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                            Self::check_cancellation(active_queries, query_id).await?;
+                            Self::update_join_progress(active_queries, query_id, rows_joined);
+                            tokio::task::yield_now().await;
+                        }
+
+                        let left_key: Vec<Value> = key_info.left_indices.iter().map(|&i| left_row[i].clone()).collect();
+                        if let Some(right_indices) = hash_table.get(&left_key) {
+                            matched_left_indices.insert(left_idx);
+                            for &right_idx in right_indices {
+                                let right_row = &right_rows[right_idx];
+                                let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                                result.push(combined_row);
+                                rows_joined += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        if left_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                            Self::check_cancellation(active_queries, query_id).await?;
+                            Self::update_join_progress(active_queries, query_id, rows_joined);
+                            tokio::task::yield_now().await;
+                        }
+
+                        let mut matched = false;
+                        for right_row in right_rows {
+                            let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                            if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
+                                matched_left_indices.insert(left_idx);
+                                result.push(combined_row);
+                                rows_joined += 1;
+                                matched = true;
+                            }
+                        }
+                        if !matched {
+                            let mut combined = left_row.clone();
+                            combined.extend(right_null_row.clone());
+                            result.push(combined);
+                            rows_joined += 1;
+                        }
+                    }
+                }
+            }
+            Some(crate::parser::ast::JoinCondition::Using(columns)) => {
+                let mut left_indices = Vec::new();
+                let mut right_indices = Vec::new();
+                for col_name in columns {
+                    left_indices.push(left_schema.find_column(None, col_name)?);
+                    right_indices.push(right_schema.find_column(None, col_name)?);
+                }
+                
+                let key_info = JoinKeyInfo {
+                    left_indices,
+                    right_indices,
+                };
+                
+                let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                let mut right_skip_indices = std::collections::HashSet::new();
+                for col_name in columns {
+                    if let Ok(idx) = right_schema.find_column(None, col_name) {
+                        right_skip_indices.insert(idx);
+                    }
+                }
+                
+                for (left_idx, left_row) in left_rows.iter().enumerate() {
+                    if left_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                        Self::check_cancellation(active_queries, query_id).await?;
+                        Self::update_join_progress(active_queries, query_id, rows_joined);
+                        tokio::task::yield_now().await;
+                    }
+
+                    let left_key: Vec<Value> = key_info.left_indices.iter().map(|&i| left_row[i].clone()).collect();
+                    if let Some(right_row_indices) = hash_table.get(&left_key) {
+                        matched_left_indices.insert(left_idx);
+                        for &right_idx in right_row_indices {
+                            let right_row = &right_rows[right_idx];
+                            let mut combined = left_row.clone();
+                            for (idx, val) in right_row.iter().enumerate() {
+                                if !right_skip_indices.contains(&idx) {
+                                    combined.push(val.clone());
+                                }
+                            }
+                            result.push(combined);
+                            rows_joined += 1;
+                        }
+                    }
+                }
+            }
+            None => {
+                return self.cross_join_with_progress(left_rows, right_rows, active_queries, query_id).await;
+            }
+        }
+        
+        // Add unmatched left rows
+        for (left_idx, left_row) in left_rows.iter().enumerate() {
+            if !matched_left_indices.contains(&left_idx) {
+                let mut combined = left_row.clone();
+                combined.extend(right_null_row.clone());
+                result.push(combined);
+                rows_joined += 1;
+            }
+        }
+        
+        Self::update_join_progress(active_queries, query_id, rows_joined);
+        Ok(result)
+    }
+
+    /// RIGHT JOIN with progress tracking
+    async fn right_join_with_progress(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_rows: &[Vec<Value>],
+        condition: &Option<crate::parser::ast::JoinCondition>,
+        left_schema: &CombinedSchema,
+        right_schema: &CombinedSchema,
+        active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
+        query_id: &str,
+    ) -> Result<Vec<Vec<Value>>> {
+        const PROGRESS_CHECK_INTERVAL: usize = 1000;
+        use std::collections::HashSet;
+        
+        let left_null_row: Vec<Value> = vec![Value::Null; left_schema.columns.len()];
+        let mut result = Vec::new();
+        let mut matched_right_indices = HashSet::new();
+        let mut rows_joined = 0;
+
+        match condition {
+            Some(crate::parser::ast::JoinCondition::On(expr)) => {
+                if let Some(key_info) = self.extract_equi_join_keys(expr, left_schema, right_schema) {
+                    let hash_table = self.build_hash_table(left_rows, &key_info.left_indices);
+                    
+                    for (right_idx, right_row) in right_rows.iter().enumerate() {
+                        if right_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                            Self::check_cancellation(active_queries, query_id).await?;
+                            Self::update_join_progress(active_queries, query_id, rows_joined);
+                            tokio::task::yield_now().await;
+                        }
+
+                        let right_key: Vec<Value> = key_info.right_indices.iter().map(|&i| right_row[i].clone()).collect();
+                        if let Some(left_indices) = hash_table.get(&right_key) {
+                            matched_right_indices.insert(right_idx);
+                            for &left_idx in left_indices {
+                                let left_row = &left_rows[left_idx];
+                                let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                                result.push(combined_row);
+                                rows_joined += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for (right_idx, right_row) in right_rows.iter().enumerate() {
+                        if right_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                            Self::check_cancellation(active_queries, query_id).await?;
+                            Self::update_join_progress(active_queries, query_id, rows_joined);
+                            tokio::task::yield_now().await;
+                        }
+
+                        let mut matched = false;
+                        for left_row in left_rows {
+                            let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                            if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
+                                matched_right_indices.insert(right_idx);
+                                result.push(combined_row);
+                                rows_joined += 1;
+                                matched = true;
+                            }
+                        }
+                        if !matched {
+                            let mut combined = left_null_row.clone();
+                            combined.extend(right_row.clone());
+                            result.push(combined);
+                            rows_joined += 1;
+                        }
+                    }
+                }
+            }
+            Some(crate::parser::ast::JoinCondition::Using(columns)) => {
+                let mut left_indices = Vec::new();
+                let mut right_indices = Vec::new();
+                for col_name in columns {
+                    left_indices.push(left_schema.find_column(None, col_name)?);
+                    right_indices.push(right_schema.find_column(None, col_name)?);
+                }
+                
+                let key_info = JoinKeyInfo {
+                    left_indices,
+                    right_indices,
+                };
+                
+                let hash_table = self.build_hash_table(left_rows, &key_info.left_indices);
+                let mut right_skip_indices = std::collections::HashSet::new();
+                for col_name in columns {
+                    if let Ok(idx) = right_schema.find_column(None, col_name) {
+                        right_skip_indices.insert(idx);
+                    }
+                }
+                
+                for (right_idx, right_row) in right_rows.iter().enumerate() {
+                    if right_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                        Self::check_cancellation(active_queries, query_id).await?;
+                        Self::update_join_progress(active_queries, query_id, rows_joined);
+                        tokio::task::yield_now().await;
+                    }
+
+                    let right_key: Vec<Value> = key_info.right_indices.iter().map(|&i| right_row[i].clone()).collect();
+                    if let Some(left_row_indices) = hash_table.get(&right_key) {
+                        matched_right_indices.insert(right_idx);
+                        for &left_idx in left_row_indices {
+                            let left_row = &left_rows[left_idx];
+                            let mut combined = left_row.clone();
+                            for (idx, val) in right_row.iter().enumerate() {
+                                if !right_skip_indices.contains(&idx) {
+                                    combined.push(val.clone());
+                                }
+                            }
+                            result.push(combined);
+                            rows_joined += 1;
+                        }
+                    }
+                }
+            }
+            None => {
+                return self.cross_join_with_progress(left_rows, right_rows, active_queries, query_id).await;
+            }
+        }
+        
+        // Add unmatched right rows
+        for (right_idx, right_row) in right_rows.iter().enumerate() {
+            if !matched_right_indices.contains(&right_idx) {
+                let mut combined = left_null_row.clone();
+                combined.extend(right_row.clone());
+                result.push(combined);
+                rows_joined += 1;
+            }
+        }
+        
+        Self::update_join_progress(active_queries, query_id, rows_joined);
+        Ok(result)
+    }
+
+    /// FULL OUTER JOIN with progress tracking
+    async fn full_outer_join_with_progress(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_rows: &[Vec<Value>],
+        condition: &Option<crate::parser::ast::JoinCondition>,
+        left_schema: &CombinedSchema,
+        right_schema: &CombinedSchema,
+        active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
+        query_id: &str,
+    ) -> Result<Vec<Vec<Value>>> {
+        const PROGRESS_CHECK_INTERVAL: usize = 1000;
+        use std::collections::HashSet;
+        
+        let mut result = Vec::new();
+        let left_null_row: Vec<Value> = vec![Value::Null; left_schema.columns.len()];
+        let right_null_row: Vec<Value> = vec![Value::Null; right_schema.columns.len()];
+        let mut matched_left_indices = HashSet::new();
+        let mut matched_right_indices = HashSet::new();
+        let mut rows_joined = 0;
+
+        match condition {
+            Some(crate::parser::ast::JoinCondition::On(expr)) => {
+                if let Some(key_info) = self.extract_equi_join_keys(expr, left_schema, right_schema) {
+                    let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                    
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        if left_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                            Self::check_cancellation(active_queries, query_id).await?;
+                            Self::update_join_progress(active_queries, query_id, rows_joined);
+                            tokio::task::yield_now().await;
+                        }
+
+                        let left_key: Vec<Value> = key_info.left_indices.iter().map(|&i| left_row[i].clone()).collect();
+                        if let Some(right_indices) = hash_table.get(&left_key) {
+                            matched_left_indices.insert(left_idx);
+                            for &right_idx in right_indices {
+                                matched_right_indices.insert(right_idx);
+                                let right_row = &right_rows[right_idx];
+                                let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                                result.push(combined_row);
+                                rows_joined += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for (left_idx, left_row) in left_rows.iter().enumerate() {
+                        if left_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                            Self::check_cancellation(active_queries, query_id).await?;
+                            Self::update_join_progress(active_queries, query_id, rows_joined);
+                            tokio::task::yield_now().await;
+                        }
+
+                        for (right_idx, right_row) in right_rows.iter().enumerate() {
+                            let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                            if self.evaluate_join_condition(expr, &combined_row, left_schema, right_schema)? {
+                                matched_left_indices.insert(left_idx);
+                                matched_right_indices.insert(right_idx);
+                                result.push(combined_row);
+                                rows_joined += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Some(crate::parser::ast::JoinCondition::Using(columns)) => {
+                let mut left_indices = Vec::new();
+                let mut right_indices = Vec::new();
+                for col_name in columns {
+                    left_indices.push(left_schema.find_column(None, col_name)?);
+                    right_indices.push(right_schema.find_column(None, col_name)?);
+                }
+                
+                let key_info = JoinKeyInfo {
+                    left_indices,
+                    right_indices,
+                };
+                
+                let hash_table = self.build_hash_table(right_rows, &key_info.right_indices);
+                let mut right_skip_indices = std::collections::HashSet::new();
+                for col_name in columns {
+                    if let Ok(idx) = right_schema.find_column(None, col_name) {
+                        right_skip_indices.insert(idx);
+                    }
+                }
+                
+                for (left_idx, left_row) in left_rows.iter().enumerate() {
+                    if left_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                        Self::check_cancellation(active_queries, query_id).await?;
+                        Self::update_join_progress(active_queries, query_id, rows_joined);
+                        tokio::task::yield_now().await;
+                    }
+
+                    let left_key: Vec<Value> = key_info.left_indices.iter().map(|&i| left_row[i].clone()).collect();
+                    if let Some(right_row_indices) = hash_table.get(&left_key) {
+                        matched_left_indices.insert(left_idx);
+                        for &right_idx in right_row_indices {
+                            matched_right_indices.insert(right_idx);
+                            let right_row = &right_rows[right_idx];
+                            let mut combined = left_row.clone();
+                            for (idx, val) in right_row.iter().enumerate() {
+                                if !right_skip_indices.contains(&idx) {
+                                    combined.push(val.clone());
+                                }
+                            }
+                            result.push(combined);
+                            rows_joined += 1;
+                        }
+                    }
+                }
+            }
+            None => {
+                return self.cross_join_with_progress(left_rows, right_rows, active_queries, query_id).await;
+            }
+        }
+        
+        // Add unmatched rows
+        for (left_idx, left_row) in left_rows.iter().enumerate() {
+            if !matched_left_indices.contains(&left_idx) {
+                let mut combined = left_row.clone();
+                combined.extend(right_null_row.clone());
+                result.push(combined);
+                rows_joined += 1;
+            }
+        }
+        for (right_idx, right_row) in right_rows.iter().enumerate() {
+            if !matched_right_indices.contains(&right_idx) {
+                let mut combined = left_null_row.clone();
+                combined.extend(right_row.clone());
+                result.push(combined);
+                rows_joined += 1;
+            }
+        }
+        
+        Self::update_join_progress(active_queries, query_id, rows_joined);
+        Ok(result)
+    }
+
+    /// CROSS JOIN with progress tracking
+    async fn cross_join_with_progress(
+        &self,
+        left_rows: &[Vec<Value>],
+        right_rows: &[Vec<Value>],
+        active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
+        query_id: &str,
+    ) -> Result<Vec<Vec<Value>>> {
+        const PROGRESS_CHECK_INTERVAL: usize = 1000;
+        let mut result = Vec::new();
+        let mut rows_joined = 0;
+
+        for (left_idx, left_row) in left_rows.iter().enumerate() {
+            if left_idx % PROGRESS_CHECK_INTERVAL == 0 {
+                Self::check_cancellation(active_queries, query_id).await?;
+                Self::update_join_progress(active_queries, query_id, rows_joined);
+                tokio::task::yield_now().await;
+            }
+
+            for right_row in right_rows {
+                let combined_row = [left_row.as_slice(), right_row.as_slice()].concat();
+                result.push(combined_row);
+                rows_joined += 1;
+            }
+        }
+        
+        Self::update_join_progress(active_queries, query_id, rows_joined);
+        Ok(result)
+    }
+
     /// Extract equi-join keys from ON condition (e.g., left.id = right.user_id)
     /// Returns Some(JoinKeyInfo) if it's a simple equi-join, None otherwise
     fn extract_equi_join_keys(
@@ -1938,16 +2561,29 @@ impl Executor {
         }
     }
 
-    /// Execute aggregation with combined schema
-    fn execute_aggregation_with_schema(
+    /// Execute aggregation with combined schema (async with progress tracking)
+    async fn execute_aggregation_with_schema(
         &self,
         schema: &CombinedSchema,
         filtered_rows: &[Vec<Value>],
         columns: &[crate::parser::ast::SelectItem],
         group_by: &Option<Vec<String>>,
         limit: &Option<u64>,
+        active_queries: Option<&Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>>,
+        query_id: Option<&str>,
     ) -> Result<QueryResult> {
         use std::collections::HashMap;
+        const PROGRESS_CHECK_INTERVAL: usize = 1000;
+
+        // Update progress: Aggregating
+        if let (Some(queries), Some(id)) = (active_queries, query_id) {
+            if let Ok(mut q) = queries.lock() {
+                if let Some(tracker) = q.get_mut(id) {
+                    tracker.set_stage(format!("Aggregating {} rows", filtered_rows.len()));
+                    tracker.estimated_total_rows = filtered_rows.len();
+                }
+            }
+        }
 
         // Group rows by GROUP BY columns
         let mut groups: HashMap<Vec<Value>, Vec<&Vec<Value>>> = HashMap::new();
@@ -1960,8 +2596,21 @@ impl Executor {
                 group_by_indices.push(idx);
             }
 
-            // Group rows
-            for row in filtered_rows {
+            // Group rows with progress tracking
+            for (idx, row) in filtered_rows.iter().enumerate() {
+                // Check cancellation periodically
+                if idx % PROGRESS_CHECK_INTERVAL == 0 {
+                    if let (Some(queries), Some(id)) = (active_queries, query_id) {
+                        Self::check_cancellation(queries, id).await?;
+                        if let Ok(mut q) = queries.lock() {
+                            if let Some(tracker) = q.get_mut(id) {
+                                tracker.update_rows_aggregated(idx);
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+
                 let group_key: Vec<Value> = group_by_indices.iter().map(|&idx| row[idx].clone()).collect();
                 groups.entry(group_key).or_insert_with(Vec::new).push(row);
             }
@@ -1993,8 +2642,23 @@ impl Executor {
 
         // Compute aggregates for each group
         let mut result_rows = Vec::new();
+        let total_groups = groups.len();
+        let mut processed_groups = 0;
 
         for (group_key, group_rows) in &groups {
+            // Check cancellation periodically
+            if processed_groups % PROGRESS_CHECK_INTERVAL == 0 {
+                if let (Some(queries), Some(id)) = (active_queries, query_id) {
+                    Self::check_cancellation(queries, id).await?;
+                    if let Ok(mut q) = queries.lock() {
+                        if let Some(tracker) = q.get_mut(id) {
+                            tracker.update_rows_aggregated(processed_groups);
+                            tracker.set_stage(format!("Computing aggregates ({}/{} groups)", processed_groups, total_groups));
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
             let mut result_row = Vec::new();
 
             for item in columns {
@@ -2022,6 +2686,17 @@ impl Executor {
             }
 
             result_rows.push(result_row);
+            processed_groups += 1;
+        }
+
+        // Update final aggregation progress
+        if let (Some(queries), Some(id)) = (active_queries, query_id) {
+            if let Ok(mut q) = queries.lock() {
+                if let Some(tracker) = q.get_mut(id) {
+                    tracker.update_rows_aggregated(processed_groups);
+                    tracker.set_stage("Aggregation complete".to_string());
+                }
+            }
         }
 
         // Apply LIMIT after aggregation

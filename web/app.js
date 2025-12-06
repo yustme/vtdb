@@ -678,13 +678,36 @@ function displayProgress(progress) {
                 ? Math.round((table.rows_scanned / table.total_rows) * 100)
                 : 0;
             progressHtml += `<div class="table-progress-item">`;
-            progressHtml += `<div class="table-progress-name">${table.table_name}</div>`;
+            progressHtml += `<div class="table-progress-name">Table: ${table.table_name}</div>`;
             progressHtml += `<div class="table-progress-bar-container">`;
             progressHtml += `<div class="table-progress-bar" style="width: ${tablePercent}%"></div>`;
             progressHtml += `</div>`;
-            progressHtml += `<div class="table-progress-info">${table.rows_scanned.toLocaleString()} / ${table.total_rows.toLocaleString()} rows (${tablePercent}%)</div>`;
+            progressHtml += `<div class="table-progress-info">${table.rows_scanned.toLocaleString()} / ${table.total_rows.toLocaleString()} rows scanned (${tablePercent}%)</div>`;
             progressHtml += `</div>`;
         });
+        progressHtml += `</div>`;
+    }
+    
+    // JOIN progress
+    if (progress.rows_joined !== undefined && progress.rows_joined > 0) {
+        progressHtml += `<div class="join-progress-section" style="margin-top: 15px; padding: 10px; background: #f0f8ff; border-radius: 4px;">`;
+        progressHtml += `<div class="join-progress-header" style="font-weight: bold; margin-bottom: 5px;">JOIN Operation</div>`;
+        progressHtml += `<div class="join-progress-info">Rows joined: ${progress.rows_joined.toLocaleString()}</div>`;
+        progressHtml += `</div>`;
+    }
+    
+    // Aggregation progress
+    if (progress.rows_aggregated !== undefined && progress.rows_aggregated > 0) {
+        progressHtml += `<div class="aggregation-progress-section" style="margin-top: 15px; padding: 10px; background: #f0fff0; border-radius: 4px;">`;
+        progressHtml += `<div class="aggregation-progress-header" style="font-weight: bold; margin-bottom: 5px;">Aggregation Operation</div>`;
+        progressHtml += `<div class="aggregation-progress-info">Rows aggregated: ${progress.rows_aggregated.toLocaleString()}</div>`;
+        if (progress.estimated_total_rows > 0) {
+            const aggPercent = Math.round((progress.rows_aggregated / progress.estimated_total_rows) * 100);
+            progressHtml += `<div class="aggregation-progress-bar-container" style="margin-top: 5px;">`;
+            progressHtml += `<div class="aggregation-progress-bar" style="width: ${aggPercent}%; height: 8px; background: #4caf50; border-radius: 4px;"></div>`;
+            progressHtml += `</div>`;
+            progressHtml += `<div class="aggregation-progress-info" style="margin-top: 3px; font-size: 0.9em;">${aggPercent}% complete</div>`;
+        }
         progressHtml += `</div>`;
     }
     
