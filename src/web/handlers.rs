@@ -55,6 +55,10 @@ pub struct QueryResultResponse {
 pub struct TableInfo {
     pub name: String,
     pub row_count: usize,
+    pub has_pending_buffer: bool,
+    pub pending_buffer_rows: usize,
+    pub has_pending_files: bool,
+    pub pending_file_count: usize,
 }
 
 #[derive(Serialize)]
@@ -216,15 +220,23 @@ pub async fn list_tables(
     State(db): State<Arc<Mutex<Database>>>,
 ) -> Result<Json<ListTablesResponse>, StatusCode> {
     let tables = {
-        let db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut db = db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let table_names = db.list_tables();
         let mut table_infos = Vec::new();
         
         for table_name in table_names {
             let row_count = db.get_table_row_count(&table_name).unwrap_or(0);
+            let has_pending_buffer = db.has_pending_buffer_data(&table_name);
+            let pending_buffer_rows = db.get_pending_buffer_row_count(&table_name);
+            let has_pending_files = db.has_pending_data_files(&table_name);
+            let pending_file_count = db.get_pending_data_file_count(&table_name);
             table_infos.push(TableInfo {
                 name: table_name,
                 row_count,
+                has_pending_buffer,
+                pending_buffer_rows,
+                has_pending_files,
+                pending_file_count,
             });
         }
         

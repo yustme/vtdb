@@ -11,6 +11,9 @@ use super::handlers;
 
 /// Start the web server
 pub async fn start_server(db: Arc<Mutex<Database>>) -> anyhow::Result<()> {
+    // Start background flush task for automatic flushing
+    start_background_flush_task(db.clone());
+    
     // Get the absolute path to the web directory
     let web_dir = std::env::current_dir()?
         .join("web");
@@ -42,6 +45,49 @@ pub async fn start_server(db: Arc<Mutex<Database>>) -> anyhow::Result<()> {
     
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Start background task for automatic flushing
+fn start_background_flush_task(db: Arc<Mutex<Database>>) {
+    use tokio::time::{interval, Duration};
+    
+    // Spawn background task that runs every 3 seconds
+    tokio::spawn(async move {
+        let mut flush_interval = interval(Duration::from_secs(3));
+        let mut safety_flush_interval = interval(Duration::from_secs(8)); // Safety net every 8 seconds
+        
+        loop {
+            tokio::select! {
+                _ = flush_interval.tick() => {
+                    // Regular flush check every 3 seconds
+                    if let Ok(mut db_guard) = db.lock() {
+                        if let Err(e) = db_guard.storage.flush_all_pending_buffers() {
+                            eprintln!("Warning: Background flush task error: {}", e);
+                        }
+                    }
+                }
+                _ = safety_flush_interval.tick() => {
+                    // Safety flush every 8 seconds - flush ALL tables with any pending data
+                    if let Ok(mut db_guard) = db.lock() {
+                        // Force flush all tables with pending buffers (safety net)
+                        let tables = db_guard.storage.get_tables_with_pending_buffers();
+                        
+                        for table_name in tables {
+                            // Check if table still has pending data
+                            let has_pending = db_guard.storage.has_pending_buffer_data(&table_name)
+                                || db_guard.storage.has_pending_data_files(&table_name);
+                            
+                            if has_pending {
+                                if let Err(e) = db_guard.storage.flush_table_iceberg_writes(&table_name) {
+                                    eprintln!("Warning: Safety flush failed for table {}: {}", table_name, e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn open_browser() -> anyhow::Result<()> {

@@ -295,7 +295,19 @@ impl Database {
     /// Get table schema information
     pub fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
         let table = self.catalog.get_table(table_name)?;
-        let stats = self.get_table_stats(table_name).ok();
+        // Note: get_table_stats requires mutable access for flushing, but we can't mutate here
+        // So we'll get row count separately without flushing (it's just for display)
+        let stats = {
+            // Try to get row count without flushing (for display purposes)
+            // Use get_row_count_from_iceberg which doesn't require mutable access
+            let row_count = self.storage.get_row_count_from_iceberg(table_name).ok()
+                .unwrap_or(0);
+            let storage_size_bytes = self.storage.estimate_storage_size(table_name).ok().unwrap_or(0);
+            Some(TableStats {
+                row_count,
+                storage_size_bytes,
+            })
+        };
         let index_manager = self.storage.index_manager();
         let table_indexes = index_manager.get_table_indexes(table_name);
         
@@ -323,8 +335,28 @@ impl Database {
     }
 
     /// Get row count for a table
-    pub fn get_table_row_count(&self, table_name: &str) -> Result<usize> {
+    pub fn get_table_row_count(&mut self, table_name: &str) -> Result<usize> {
         self.storage.get_row_count(table_name)
+    }
+
+    /// Check if a table has pending data in the write buffer
+    pub fn has_pending_buffer_data(&self, table_name: &str) -> bool {
+        self.storage.has_pending_buffer_data(table_name)
+    }
+
+    /// Get the number of rows pending in the write buffer for a table
+    pub fn get_pending_buffer_row_count(&self, table_name: &str) -> usize {
+        self.storage.get_pending_buffer_row_count(table_name)
+    }
+
+    /// Check if a table has pending data files waiting to be flushed to manifest
+    pub fn has_pending_data_files(&self, table_name: &str) -> bool {
+        self.storage.has_pending_data_files(table_name)
+    }
+
+    /// Get the number of pending data files for a table
+    pub fn get_pending_data_file_count(&self, table_name: &str) -> usize {
+        self.storage.get_pending_data_file_count(table_name)
     }
 
     /// Get storage size in bytes for a table
@@ -333,7 +365,7 @@ impl Database {
     }
 
     /// Get table statistics (row count and storage size)
-    pub fn get_table_stats(&self, table_name: &str) -> Result<TableStats> {
+    pub fn get_table_stats(&mut self, table_name: &str) -> Result<TableStats> {
         let row_count = self.get_table_row_count(table_name)?;
         let storage_size_bytes = self.get_table_storage_size(table_name)?;
         Ok(TableStats {

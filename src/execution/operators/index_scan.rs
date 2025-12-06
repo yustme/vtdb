@@ -11,7 +11,7 @@ impl IndexScan {
         table: &str,
         column: &str,
         key: Value,
-        storage: &StorageEngine,
+        storage: &mut StorageEngine,
     ) -> Result<Vec<usize>> {
         let index_manager = storage.index_manager();
         if let Some(index) = index_manager.get_index(table, column) {
@@ -27,7 +27,7 @@ impl IndexScan {
         column: &str,
         min: Value,
         max: Value,
-        storage: &StorageEngine,
+        storage: &mut StorageEngine,
     ) -> Result<Vec<usize>> {
         let index_manager = storage.index_manager();
         if let Some(index) = index_manager.get_index(table, column) {
@@ -42,7 +42,7 @@ impl IndexScan {
     pub fn get_rows_by_ids(
         table: &str,
         row_ids: &[usize],
-        storage: &StorageEngine,
+        storage: &mut StorageEngine,
     ) -> Result<Vec<Vec<Value>>> {
         let all_rows = storage.scan_table(table)?;
         let mut result = Vec::new();

@@ -1,11 +1,12 @@
 pub mod catalog;
+pub mod config;
 pub mod manifest;
 pub mod parquet_reader;
 pub mod parquet_writer;
 pub mod schema;
 pub mod snapshot;
+pub mod write_buffer;
 
-use anyhow::Result;
 use catalog::IcebergCatalog;
 use std::path::PathBuf;
 

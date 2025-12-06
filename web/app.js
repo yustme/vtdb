@@ -47,6 +47,11 @@ require(['vs/editor/editor.main'], function () {
         fontWeight: '700',
         fontFamily: "'Courier New', 'Courier', monospace",
     });
+    
+    // Add Command+Enter (Mac) or Ctrl+Enter (Windows/Linux) shortcut to execute query at cursor
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, function() {
+        executeQueryAtCursor();
+    });
 });
 
 // Execute query button handler
@@ -55,6 +60,7 @@ document.getElementById('execute-btn').addEventListener('click', function() {
     if (executeBtn.classList.contains('cancel-mode')) {
         cancelQuery();
     } else {
+        // Button click executes entire editor content (default behavior)
         executeQuery();
     }
 });
@@ -62,12 +68,8 @@ document.getElementById('execute-btn').addEventListener('click', function() {
 // Refresh tables button
 document.getElementById('refresh-tables-btn').addEventListener('click', loadTables);
 
-// Execute on Ctrl+Enter
-document.addEventListener('keydown', function(e) {
-    if (e.ctrlKey && e.key === 'Enter') {
-        executeQuery();
-    }
-});
+// Note: Keyboard shortcut for Command+Enter/Ctrl+Enter is now handled by Monaco Editor
+// using editor.addCommand() above, which ensures it only triggers when editor is focused
 
 // Load tables on page load
 window.addEventListener('DOMContentLoaded', function() {
@@ -133,12 +135,87 @@ function initSidebarResizer() {
     }
 }
 
-async function executeQuery() {
-    const query = editor.getValue();
+// Get the query at the cursor position (for multi-query support)
+// This function finds the SQL query that contains the cursor position,
+// delimited by semicolons (like Snowsight)
+function getQueryAtCursor() {
+    if (!editor) return null;
+    
+    const position = editor.getPosition();
+    const model = editor.getModel();
+    const fullText = model.getValue();
+    const lineCount = model.getLineCount();
+    
+    // Get current cursor offset
+    const cursorOffset = model.getOffsetAt(position);
+    
+    // Find the start of the query (last semicolon before cursor, or start of file)
+    let startOffset = 0;
+    
+    // Search backwards from cursor for semicolon
+    const textBeforeCursor = fullText.substring(0, cursorOffset);
+    const lastSemicolonIndex = textBeforeCursor.lastIndexOf(';');
+    
+    if (lastSemicolonIndex !== -1) {
+        // Found a semicolon before cursor
+        // Start from character after the semicolon
+        startOffset = lastSemicolonIndex + 1;
+        // Skip whitespace after semicolon
+        while (startOffset < cursorOffset && /\s/.test(fullText[startOffset])) {
+            startOffset++;
+        }
+    } else {
+        // No semicolon before cursor, start from beginning of file
+        startOffset = 0;
+        // Skip leading whitespace
+        while (startOffset < fullText.length && /\s/.test(fullText[startOffset])) {
+            startOffset++;
+        }
+    }
+    
+    // Find the end of the query (first semicolon after cursor, or end of file)
+    let endOffset = fullText.length;
+    
+    // Search forwards from cursor for semicolon
+    const textAfterCursor = fullText.substring(cursorOffset);
+    const nextSemicolonIndex = textAfterCursor.indexOf(';');
+    
+    if (nextSemicolonIndex !== -1) {
+        // Found a semicolon after cursor
+        // Include the semicolon
+        endOffset = cursorOffset + nextSemicolonIndex + 1;
+    } else {
+        // No semicolon after cursor, go to end of file
+        endOffset = fullText.length;
+    }
+    
+    // Extract the query and trim whitespace
+    const query = fullText.substring(startOffset, endOffset).trim();
+    
+    return query;
+}
+
+// Execute query at cursor position (for Command+Enter shortcut)
+async function executeQueryAtCursor() {
+    const query = getQueryAtCursor();
+    
+    if (!query || !query.trim()) {
+        // Fallback to executing entire editor if no query found at cursor
+        executeQuery();
+        return;
+    }
+    
+    // Execute the specific query
+    await executeQuery(query);
+}
+
+async function executeQuery(queryText) {
+    // If queryText is provided, use it; otherwise get entire editor content
+    const query = queryText !== undefined ? queryText : editor.getValue();
     const resultsContainer = document.getElementById('results-container');
     const executeBtn = document.getElementById('execute-btn');
     
-    if (!query.trim()) {
+    if (!query || !query.trim()) {
         showError('Please enter a SQL query');
         return;
     }
@@ -175,7 +252,59 @@ async function executeQuery() {
             signal: currentAbortController.signal,
         });
         
-        const data = await response.json();
+        // Check if response is OK before parsing
+        if (!response.ok) {
+            stopExecutionTimer();
+            stopProgressPolling();
+            resetExecuteButton();
+            executionStartTime = null;
+            
+            // Try to parse error response
+            let errorMessage = `HTTP error! status: ${response.status}`;
+            try {
+                const errorData = await response.json();
+                if (errorData.error) {
+                    errorMessage = errorData.error;
+                } else if (errorData.message) {
+                    errorMessage = errorData.message;
+                }
+            } catch (e) {
+                // If JSON parsing fails, try to get text
+                try {
+                    const errorText = await response.text();
+                    if (errorText) {
+                        errorMessage = errorText;
+                    }
+                } catch (e2) {
+                    // Use default error message
+                }
+            }
+            showError(errorMessage);
+            return;
+        }
+        
+        // Parse JSON response
+        let data;
+        try {
+            data = await response.json();
+        } catch (error) {
+            stopExecutionTimer();
+            stopProgressPolling();
+            resetExecuteButton();
+            executionStartTime = null;
+            showError('Failed to parse server response: ' + error.message);
+            return;
+        }
+        
+        // Validate response structure
+        if (typeof data !== 'object' || data === null) {
+            stopExecutionTimer();
+            stopProgressPolling();
+            resetExecuteButton();
+            executionStartTime = null;
+            showError('Invalid server response format');
+            return;
+        }
         
         if (data.success) {
             // Check if this is an async query (has query_id)
@@ -207,8 +336,13 @@ async function executeQuery() {
                 }
             }
         } else {
+            // Error response from server
+            stopExecutionTimer();
+            stopProgressPolling();
             resetExecuteButton();
-            showError(data.error || 'Unknown error occurred');
+            executionStartTime = null;
+            const errorMessage = data.error || data.message || 'Unknown error occurred';
+            showError(errorMessage);
         }
     } catch (error) {
         stopExecutionTimer();
@@ -331,7 +465,36 @@ function stopProgressPolling() {
 async function pollProgress(queryId) {
     try {
         const response = await fetch(`/api/query/${queryId}/progress`);
-        const data = await response.json();
+        
+        if (!response.ok) {
+            stopProgressPolling();
+            stopExecutionTimer();
+            resetExecuteButton();
+            executionStartTime = null;
+            let errorMessage = `Failed to get query progress: HTTP ${response.status}`;
+            try {
+                const errorData = await response.json();
+                if (errorData.error) {
+                    errorMessage = errorData.error;
+                }
+            } catch (e) {
+                // Use default error message
+            }
+            showError(errorMessage);
+            return;
+        }
+        
+        let data;
+        try {
+            data = await response.json();
+        } catch (error) {
+            stopProgressPolling();
+            stopExecutionTimer();
+            resetExecuteButton();
+            executionStartTime = null;
+            showError('Failed to parse progress response: ' + error.message);
+            return;
+        }
         
         if (data.success && data.progress) {
             displayProgress(data.progress);
@@ -346,19 +509,74 @@ async function pollProgress(queryId) {
                 stopProgressPolling();
                 stopExecutionTimer();
                 resetExecuteButton();
+                executionStartTime = null;
                 const errorMsg = data.progress.error_message || `Query ${data.progress.status.toLowerCase()}`;
                 showError(errorMsg);
             }
+        } else if (!data.success) {
+            // Error in progress response
+            stopProgressPolling();
+            stopExecutionTimer();
+            resetExecuteButton();
+            executionStartTime = null;
+            const errorMsg = data.error || 'Failed to get query progress';
+            showError(errorMsg);
         }
     } catch (error) {
         console.error('Failed to poll progress:', error);
+        // Don't stop polling on network errors, but log them
+        if (error.name === 'AbortError') {
+            // Query was cancelled, stop polling
+            stopProgressPolling();
+            stopExecutionTimer();
+            resetExecuteButton();
+            executionStartTime = null;
+        }
     }
 }
 
 async function fetchQueryResult(queryId) {
     try {
         const response = await fetch(`/api/query/${queryId}/result`);
-        const data = await response.json();
+        
+        if (!response.ok) {
+            stopExecutionTimer();
+            resetExecuteButton();
+            executionStartTime = null;
+            currentQueryId = null;
+            let errorMessage = `Failed to fetch query result: HTTP ${response.status}`;
+            try {
+                const errorData = await response.json();
+                if (errorData.error) {
+                    errorMessage = errorData.error;
+                } else if (errorData.message) {
+                    errorMessage = errorData.message;
+                }
+            } catch (e) {
+                try {
+                    const errorText = await response.text();
+                    if (errorText) {
+                        errorMessage = errorText;
+                    }
+                } catch (e2) {
+                    // Use default error message
+                }
+            }
+            showError(errorMessage);
+            return;
+        }
+        
+        let data;
+        try {
+            data = await response.json();
+        } catch (error) {
+            stopExecutionTimer();
+            resetExecuteButton();
+            executionStartTime = null;
+            currentQueryId = null;
+            showError('Failed to parse query result: ' + error.message);
+            return;
+        }
         
         if (data.success && data.result) {
             // CRITICAL: Stop timer FIRST to prevent overwriting results
@@ -382,11 +600,20 @@ async function fetchQueryResult(queryId) {
             displayResults(data.result, executionTime, fromCache);
         } else {
             stopExecutionTimer();
-            showError(data.error || 'Failed to fetch query result');
+            resetExecuteButton();
+            executionStartTime = null;
+            const errorMessage = data.error || data.message || 'Failed to fetch query result';
+            showError(errorMessage);
         }
     } catch (error) {
         stopExecutionTimer();
-        showError('Failed to fetch query result: ' + error.message);
+        resetExecuteButton();
+        executionStartTime = null;
+        if (error.name === 'AbortError') {
+            showError('Query result fetch was cancelled');
+        } else {
+            showError('Failed to fetch query result: ' + error.message);
+        }
     } finally {
         currentQueryId = null;
         // Reset executionStartTime after result is displayed
@@ -743,9 +970,32 @@ function displayTables(tables) {
     tables.forEach(tableInfo => {
         const tableName = tableInfo.name || tableInfo; // Support both old and new format
         const rowCount = tableInfo.row_count !== undefined ? tableInfo.row_count : 0;
+        const hasPendingBuffer = tableInfo.has_pending_buffer !== undefined ? tableInfo.has_pending_buffer : false;
+        const pendingBufferRows = tableInfo.pending_buffer_rows !== undefined ? tableInfo.pending_buffer_rows : 0;
+        const hasPendingFiles = tableInfo.has_pending_files !== undefined ? tableInfo.has_pending_files : false;
+        const pendingFileCount = tableInfo.pending_file_count !== undefined ? tableInfo.pending_file_count : 0;
+        
+        // Build status indicators
+        let statusHtml = '';
+        if (hasPendingBuffer || hasPendingFiles) {
+            statusHtml = '<span class="table-status-indicator">';
+            if (hasPendingBuffer) {
+                statusHtml += `<span class="buffer-status" title="${pendingBufferRows} rows in memory buffer (not yet flushed to disk)">⚠️ ${pendingBufferRows} in buffer</span>`;
+            }
+            if (hasPendingFiles) {
+                statusHtml += `<span class="file-status" title="${pendingFileCount} data files waiting to be added to manifest">📁 ${pendingFileCount} files pending</span>`;
+            }
+            statusHtml += '</span>';
+        } else {
+            statusHtml = '<span class="table-status-indicator"><span class="flushed-status" title="All data has been flushed to disk">✓ Flushed</span></span>';
+        }
+        
         html += `<div class="table-item-wrapper">
             <div class="table-item" data-table="${escapeHtml(tableName)}">
-                <span class="table-item-name">${escapeHtml(tableName)} <span class="table-row-count">(${rowCount})</span></span>
+                <div class="table-item-main">
+                    <span class="table-item-name">${escapeHtml(tableName)} <span class="table-row-count">(${rowCount})</span></span>
+                    ${statusHtml}
+                </div>
                 <button class="table-menu-btn" data-table="${escapeHtml(tableName)}" title="Table options">⋯</button>
             </div>
             <div class="table-menu" data-table="${escapeHtml(tableName)}">
@@ -848,8 +1098,8 @@ async function previewTable(tableName) {
     editor.setValue(query);
     editor.focus();
     
-    // Execute the query
-    await executeQuery();
+    // Execute the query (pass the query text explicitly)
+    await executeQuery(query);
 }
 
 // Insert table name at cursor position

@@ -194,7 +194,7 @@ impl Executor {
         filter: &Option<crate::parser::ast::Expr>,
         group_by: &Option<Vec<String>>,
         limit: &Option<u64>,
-        storage: &StorageEngine,
+        storage: &mut StorageEngine,
         catalog: &Catalog,
     ) -> Result<QueryResult> {
         // Try to use index scan for single table queries with filters
@@ -202,6 +202,12 @@ impl Executor {
             (crate::parser::ast::TableRef::Table { name, alias }, Some(filter_expr)) => {
                 // Check if we can use an index
                 if let Some((column_name, key_value)) = self.extract_equality_predicate(filter_expr) {
+                    // Flush buffer before index scan to ensure latest data is visible
+                    if storage.has_pending_buffer_data(name) {
+                        if let Err(e) = storage.flush_table_iceberg_writes(name) {
+                            eprintln!("Warning: Failed to flush buffer before index scan for table {}: {}", name, e);
+                        }
+                    }
                     // Try to use index for equality lookup
                     use crate::execution::operators::IndexScan;
                     let row_ids = IndexScan::scan_by_key(name, &column_name, key_value, storage)?;
@@ -262,7 +268,7 @@ impl Executor {
         filter: &Option<crate::parser::ast::Expr>,
         group_by: &Option<Vec<String>>,
         limit: &Option<u64>,
-        storage: &StorageEngine,
+        storage: &mut StorageEngine,
         catalog: &Catalog,
         active_queries: Option<Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>>,
         query_id: Option<&str>,
@@ -282,6 +288,12 @@ impl Executor {
             (crate::parser::ast::TableRef::Table { name, alias }, Some(filter_expr)) => {
                 // Check if we can use an index
                 if let Some((column_name, key_value)) = self.extract_equality_predicate(filter_expr) {
+                    // Flush buffer before index scan to ensure latest data is visible
+                    if storage.has_pending_buffer_data(name) {
+                        if let Err(e) = storage.flush_table_iceberg_writes(name) {
+                            eprintln!("Warning: Failed to flush buffer before index scan for table {}: {}", name, e);
+                        }
+                    }
                     // Try to use index for equality lookup
                     use crate::execution::operators::IndexScan;
                     let row_ids = IndexScan::scan_by_key(name, &column_name, key_value, storage)?;
@@ -394,7 +406,7 @@ impl Executor {
     fn execute_table_ref(
         &self,
         table_ref: &crate::parser::ast::TableRef,
-        storage: &StorageEngine,
+        storage: &mut StorageEngine,
         catalog: &Catalog,
     ) -> Result<(Vec<Vec<Value>>, CombinedSchema)> {
         match table_ref {
@@ -416,7 +428,7 @@ impl Executor {
     fn execute_table_ref_with_progress(
         &self,
         table_ref: &crate::parser::ast::TableRef,
-        storage: &StorageEngine,
+        storage: &mut StorageEngine,
         catalog: &Catalog,
         active_queries: &Arc<Mutex<HashMap<String, crate::QueryProgressTracker>>>,
         query_id: &str,
@@ -515,7 +527,7 @@ impl Executor {
         right: &crate::parser::ast::TableRef,
         join_type: &crate::parser::ast::JoinType,
         condition: &Option<crate::parser::ast::JoinCondition>,
-        storage: &StorageEngine,
+        storage: &mut StorageEngine,
         catalog: &Catalog,
     ) -> Result<(Vec<Vec<Value>>, CombinedSchema)> {
         // Execute left side
@@ -679,6 +691,7 @@ impl Executor {
         catalog: &Catalog,
     ) -> Result<QueryResult> {
         let table_schema = catalog.get_table(table)?;
+        let expected_column_count = table_schema.columns.len();
         
         // Evaluate expressions to get values
         let mut rows = Vec::new();
@@ -688,6 +701,22 @@ impl Executor {
                 let value = evaluate_expr(expr, &[], table_schema)?;
                 row.push(value);
             }
+            
+            // Validate that we don't have too many values
+            if row.len() > expected_column_count {
+                return Err(anyhow::anyhow!(
+                    "Row has {} values, but table has {} columns",
+                    row.len(),
+                    expected_column_count
+                ));
+            }
+            
+            // Pad row with NULL values if fewer values provided than columns
+            // This allows partial column inserts like INSERT INTO table VALUES (1)
+            while row.len() < expected_column_count {
+                row.push(Value::Null);
+            }
+            
             rows.push(row);
         }
 

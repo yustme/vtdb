@@ -3,22 +3,34 @@ use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use parquet::basic::{Compression, GzipLevel, ZstdLevel};
+use parquet::file::properties::{WriterProperties, WriterVersion};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use crate::Value;
 use crate::storage::iceberg::schema::IcebergSchema;
+use crate::storage::iceberg::config::IcebergWriteConfig;
 
 /// Write data to Parquet format
 pub struct ParquetWriter;
 
 impl ParquetWriter {
-    /// Write rows to a Parquet file
+    /// Write rows to a Parquet file with default settings
     pub fn write_rows(
         file_path: impl AsRef<Path>,
         schema: &IcebergSchema,
         rows: Vec<Vec<Value>>,
+    ) -> Result<usize> {
+        Self::write_rows_with_config(file_path, schema, rows, &IcebergWriteConfig::default())
+    }
+
+    /// Write rows to a Parquet file with custom configuration
+    pub fn write_rows_with_config(
+        file_path: impl AsRef<Path>,
+        schema: &IcebergSchema,
+        rows: Vec<Vec<Value>>,
+        config: &IcebergWriteConfig,
     ) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
@@ -33,15 +45,44 @@ impl ParquetWriter {
         // Create record batch
         let record_batch = RecordBatch::try_new(arrow_schema.clone(), arrays)?;
 
+        // Build optimized writer properties
+        let compression = Self::parse_compression(&config.parquet_compression)?;
+        let props = WriterProperties::builder()
+            .set_compression(compression)
+            .set_max_row_group_size(config.parquet_row_group_size)
+            .set_write_batch_size(8192) // Write batch size
+            .set_dictionary_enabled(true) // Enable dictionary encoding
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page) // Enable page-level stats
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .build();
+
+        // Ensure parent directory exists before creating file
+        if let Some(parent) = file_path.as_ref().parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("Failed to create directory {:?}: {}", parent, e))?;
+        }
+
         // Write to Parquet file
-        let file = File::create(file_path)?;
-        let props = WriterProperties::builder().build();
+        let file = File::create(file_path.as_ref())
+            .map_err(|e| anyhow::anyhow!("Failed to create Parquet file {:?}: {}", file_path.as_ref(), e))?;
         let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props))?;
         
         writer.write(&record_batch)?;
         writer.close()?;
 
         Ok(record_batch.num_rows())
+    }
+
+    /// Parse compression string to Compression enum
+    fn parse_compression(compression_str: &str) -> Result<Compression> {
+        match compression_str.to_lowercase().as_str() {
+            "snappy" => Ok(Compression::SNAPPY),
+            "zstd" => Ok(Compression::ZSTD(ZstdLevel::default())),
+            "gzip" => Ok(Compression::GZIP(GzipLevel::default())),
+            "lz4" => Ok(Compression::LZ4),
+            "uncompressed" => Ok(Compression::UNCOMPRESSED),
+            _ => Err(anyhow::anyhow!("Unsupported compression: {}", compression_str)),
+        }
     }
 
     /// Convert Iceberg schema to Arrow schema
