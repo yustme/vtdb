@@ -106,6 +106,7 @@ impl QueryProgressTracker {
 pub struct QueryResultStorage {
     pub result: Option<QueryResult>,
     pub from_cache: bool,
+    pub execution_time_ms: f64,
 }
 
 /// Main database instance
@@ -224,12 +225,14 @@ impl Database {
 
     /// Execute a SQL statement
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
-        let (result, _) = self.execute_with_cache_info(sql)?;
+        let (result, _, _) = self.execute_with_cache_info(sql)?;
         Ok(result)
     }
 
     /// Execute a SQL statement and return cache information
-    pub fn execute_with_cache_info(&mut self, sql: &str) -> Result<(QueryResult, bool)> {
+    pub fn execute_with_cache_info(&mut self, sql: &str) -> Result<(QueryResult, bool, f64)> {
+        let start_time = std::time::Instant::now();
+        
         // Parse SQL
         let ast = parse_sql(sql)?;
 
@@ -237,7 +240,8 @@ impl Database {
         if let Statement::Select(_) = &ast {
             let query_hash = hash_statement(&ast);
             if let Some(cached_result) = self.cache.get(query_hash) {
-                return Ok((cached_result, true)); // Return cached result with cache flag
+                let execution_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                return Ok((cached_result, true, execution_time_ms)); // Return cached result with cache flag and execution time
             }
         }
 
@@ -267,6 +271,10 @@ impl Database {
             Statement::Delete(delete) => {
                 self.cache.invalidate_tables(&[delete.table.clone()]);
             }
+            Statement::DropAllTables(_) => {
+                // Clear entire cache since all tables are being dropped
+                self.cache.clear();
+            }
             Statement::CreateTable(_) => {
                 // No invalidation needed - new table has no dependent queries
             }
@@ -275,7 +283,8 @@ impl Database {
             }
         }
 
-        Ok((result, false)) // Return fresh result with cache flag
+        let execution_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        Ok((result, false, execution_time_ms)) // Return fresh result with cache flag and execution time
     }
 
     /// List all tables in the database
@@ -379,7 +388,7 @@ impl Database {
             let result = execute_query_with_progress(db.clone(), query_id.clone(), sql).await;
 
             // Update tracker and store result
-            if let Ok((query_result, from_cache)) = result {
+            if let Ok((query_result, from_cache, execution_time_ms)) = result {
                 // Update tracker to completed
                 if let Ok(db_guard) = db.lock() {
                     if let Ok(mut queries) = db_guard.active_queries.lock() {
@@ -390,12 +399,13 @@ impl Database {
                     }
                 }
 
-                // Store result
+                // Store result with execution time
                 if let Ok(db_guard) = db.lock() {
                     if let Ok(mut results) = db_guard.query_results.lock() {
                         results.insert(query_id.clone(), QueryResultStorage {
                             result: Some(query_result),
                             from_cache,
+                            execution_time_ms,
                         });
                     }
                 }
@@ -421,7 +431,9 @@ async fn execute_query_with_progress(
     db: Arc<Mutex<Database>>,
     query_id: String,
     sql: String,
-) -> Result<(QueryResult, bool)> {
+) -> Result<(QueryResult, bool, f64)> {
+    let start_time = std::time::Instant::now();
+    
     // Parse SQL
     let ast = parse_sql(&sql)?;
 
@@ -431,7 +443,8 @@ async fn execute_query_with_progress(
         let mut db_guard = db.lock().map_err(|_| anyhow::anyhow!("Failed to lock database"))?;
         
         if let Some(cached_result) = db_guard.cache.get(query_hash) {
-            return Ok((cached_result, true));
+            let execution_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+            return Ok((cached_result, true, execution_time_ms));
         }
         (false, Some(query_hash))
     } else {
@@ -509,11 +522,16 @@ async fn execute_query_with_progress(
         Statement::Delete(delete) => {
             db_guard.cache.invalidate_tables(&[delete.table.clone()]);
         }
+        Statement::DropAllTables(_) => {
+            // Clear entire cache since all tables are being dropped
+            db_guard.cache.clear();
+        }
         Statement::CreateTable(_) => {}
         Statement::Select(_) => {}
     }
 
-    Ok((result, from_cache))
+    let execution_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    Ok((result, from_cache, execution_time_ms))
 }
 
 /// Helper to update progress stage

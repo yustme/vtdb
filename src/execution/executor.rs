@@ -155,6 +155,9 @@ impl Executor {
             PhysicalPlan::Delete { table, filter } => {
                 self.execute_delete(table, filter, storage, catalog)
             }
+            PhysicalPlan::DropAllTables => {
+                self.execute_drop_all_tables(storage, catalog)
+            }
         }
     }
 
@@ -745,6 +748,20 @@ impl Executor {
         };
 
         storage.delete_rows(table, predicate)?;
+
+        Ok(QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        })
+    }
+
+    fn execute_drop_all_tables(
+        &self,
+        storage: &mut StorageEngine,
+        catalog: &mut Catalog,
+    ) -> Result<QueryResult> {
+        storage.drop_all_tables()?;
+        catalog.drop_all_tables()?;
 
         Ok(QueryResult {
             rows: Vec::new(),

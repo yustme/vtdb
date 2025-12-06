@@ -25,6 +25,8 @@ pub struct ExecuteResponse {
     pub from_cache: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_time_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -45,6 +47,8 @@ pub struct QueryResultResponse {
     pub from_cache: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_time_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -75,6 +79,7 @@ pub async fn execute_query(
             error: Some("Query cannot be empty".to_string()),
             from_cache: None,
             query_id: None,
+            execution_time_ms: None,
         }));
     }
 
@@ -93,16 +98,18 @@ pub async fn execute_query(
                 error: Some(e.to_string()),
                 from_cache: None,
                 query_id: None,
+                execution_time_ms: None,
             }));
         }
         
-        // Return query ID immediately
+        // Return query ID immediately (execution time will be included in result response)
         Ok(Json(ExecuteResponse {
             success: true,
             result: None,
             error: None,
             from_cache: None,
             query_id: Some(query_id),
+            execution_time_ms: None,
         }))
     } else {
         // For non-SELECT queries, execute synchronously
@@ -112,12 +119,13 @@ pub async fn execute_query(
         };
 
         match result {
-            Ok((query_result, from_cache)) => Ok(Json(ExecuteResponse {
+            Ok((query_result, from_cache, execution_time_ms)) => Ok(Json(ExecuteResponse {
                 success: true,
                 result: Some(query_result),
                 error: None,
                 from_cache: Some(from_cache),
                 query_id: None,
+                execution_time_ms: Some(execution_time_ms),
             })),
             Err(e) => Ok(Json(ExecuteResponse {
                 success: false,
@@ -125,6 +133,7 @@ pub async fn execute_query(
                 error: Some(e.to_string()),
                 from_cache: None,
                 query_id: None,
+                execution_time_ms: None,
             })),
         }
     }
@@ -174,12 +183,14 @@ pub async fn get_query_result(
             result: storage.result,
             from_cache: Some(storage.from_cache),
             error: None,
+            execution_time_ms: Some(storage.execution_time_ms),
         })),
         None => Ok(Json(QueryResultResponse {
             success: false,
             result: None,
             from_cache: None,
             error: Some("Query result not found or query still running".to_string()),
+            execution_time_ms: None,
         })),
     }
 }

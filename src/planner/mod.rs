@@ -35,6 +35,9 @@ impl Planner {
             Statement::Delete(delete) => {
                 self.plan_delete(delete, catalog)
             }
+            Statement::DropAllTables(_) => {
+                self.plan_drop_all_tables()
+            }
         }
     }
 
@@ -226,6 +229,10 @@ impl Planner {
             table: delete.table.clone(),
             filter: delete.where_clause.clone(),
         })
+    }
+
+    fn plan_drop_all_tables(&self) -> Result<PhysicalPlan> {
+        Ok(PhysicalPlan::DropAllTables)
     }
 }
 

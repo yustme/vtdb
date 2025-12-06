@@ -16,6 +16,7 @@ pub fn extract_table_dependencies(stmt: &Statement) -> HashSet<String> {
         Statement::Insert(_) => HashSet::new(),
         Statement::Update(_) => HashSet::new(),
         Statement::Delete(_) => HashSet::new(),
+        Statement::DropAllTables(_) => HashSet::new(),
     }
 }
 

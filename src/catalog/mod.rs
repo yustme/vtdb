@@ -61,6 +61,13 @@ impl Catalog {
             .map(|s| s.list_tables())
             .unwrap_or_default()
     }
+
+    /// Drop all tables from catalog
+    pub fn drop_all_tables(&mut self) -> Result<()> {
+        // Clear all schemas (which contains all tables)
+        self.schemas.clear();
+        Ok(())
+    }
 }
 
 impl Default for Catalog {

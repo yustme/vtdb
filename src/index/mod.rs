@@ -221,6 +221,14 @@ impl IndexManager {
     }
 }
 
+impl IndexManager {
+    /// Clear all indexes (used when dropping all tables)
+    pub fn clear_all(&mut self) {
+        self.indexes.clear();
+        self.column_indices.clear();
+    }
+}
+
 impl Default for IndexManager {
     fn default() -> Self {
         Self::new()

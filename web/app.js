@@ -4,6 +4,7 @@ let executionTimerInterval = null;
 let executionStartTime = null;
 let progressPollInterval = null;
 let currentQueryId = null;
+let resultsDisplayed = false; // Flag to prevent timer from overwriting displayed results
 
 // Initialize Monaco Editor
 require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
@@ -147,6 +148,12 @@ async function executeQuery() {
         currentAbortController.abort();
     }
     
+    // Reset any previous execution time tracking to ensure clean start
+    executionStartTime = null;
+    resultsDisplayed = false; // Reset flag
+    stopExecutionTimer();
+    stopProgressPolling();
+    
     // Create new abort controller for this query
     currentAbortController = new AbortController();
     
@@ -154,7 +161,7 @@ async function executeQuery() {
     executeBtn.textContent = 'Cancel Query';
     executeBtn.classList.add('cancel-mode');
     
-    // Show loading state with timer
+    // Set start time immediately when button is pressed (before any async operations)
     executionStartTime = performance.now();
     startExecutionTimer();
     
@@ -177,20 +184,25 @@ async function executeQuery() {
                 // Keep timer running for async queries - start polling for progress
                 startProgressPolling(data.query_id);
             } else {
-                // Stop timer for synchronous queries
+                // CRITICAL: Stop timer FIRST to prevent overwriting results
                 stopExecutionTimer();
+                
+                // Extract EXACT values from backend response - NO client-side calculation
+                // Backend response format: { execution_time_ms: 0.103666..., from_cache: true }
+                const executionTime = (typeof data.execution_time_ms === 'number') ? data.execution_time_ms : 0;
+                const fromCache = (data.from_cache === true);
+                
+                // Debug: Verify we're using backend values
+                console.log('Backend response:', JSON.stringify({ execution_time_ms: data.execution_time_ms, from_cache: data.from_cache }));
+                console.log('Using values:', { executionTime, fromCache });
+                
+                resetExecuteButton();
                 if (data.result) {
-                    // Synchronous execution completed immediately
-                    const endTime = performance.now();
-                    const executionTime = endTime - executionStartTime;
-                    resetExecuteButton();
-                    displayResults(data.result, executionTime, data.from_cache || false);
+                    // Pass ONLY backend-provided values - NO client-side timing
+                    displayResults(data.result, executionTime, fromCache);
                 } else {
-                    // No results
-                    const endTime = performance.now();
-                    const executionTime = endTime - executionStartTime;
-                    resetExecuteButton();
-                    const cacheText = data.from_cache ? ' • Cache used' : '';
+                    // No results - show execution info
+                    const cacheText = fromCache ? ' • Cache used' : '';
                     showSuccess(`Query executed successfully (no results) - Execution time: ${formatExecutionTime(executionTime)}${cacheText}`);
                 }
             }
@@ -217,9 +229,15 @@ async function executeQuery() {
         } else {
             showError('Failed to execute query: ' + error.message);
         }
+        // Only reset executionStartTime if query failed or was cancelled
+        // For async queries, keep it until result is fetched
+        if (!currentQueryId) {
+            executionStartTime = null;
+        }
     } finally {
         currentAbortController = null;
-        executionStartTime = null;
+        // Don't reset executionStartTime here for async queries
+        // It will be reset in fetchQueryResult() after displaying results
     }
 }
 
@@ -242,6 +260,9 @@ async function cancelQuery() {
     // Stop timers and polling
     stopExecutionTimer();
     stopProgressPolling();
+    
+    // Reset execution start time
+    executionStartTime = null;
     
     // Reset button
     resetExecuteButton();
@@ -279,6 +300,8 @@ function stopExecutionTimer() {
         clearInterval(executionTimerInterval);
         executionTimerInterval = null;
     }
+    // Also clear executionStartTime to prevent any timing calculations
+    executionStartTime = null;
 }
 
 function startProgressPolling(queryId) {
@@ -338,11 +361,25 @@ async function fetchQueryResult(queryId) {
         const data = await response.json();
         
         if (data.success && data.result) {
-            const endTime = performance.now();
-            const executionTime = endTime - executionStartTime;
+            // CRITICAL: Stop timer FIRST to prevent overwriting results
             stopExecutionTimer();
+            
+            // Extract EXACT values from backend response
+            // Backend response: { execution_time_ms: 0.103666..., from_cache: true }
+            const executionTime = (typeof data.execution_time_ms === 'number') ? data.execution_time_ms : 0;
+            const fromCache = (data.from_cache === true);
+            
+            // Debug logging to verify we're using backend values
+            console.log('Using backend values (async):', {
+                'data.execution_time_ms': data.execution_time_ms,
+                'data.from_cache': data.from_cache,
+                'extracted executionTime (ms)': executionTime,
+                'extracted fromCache': fromCache
+            });
+            
             resetExecuteButton();
-            displayResults(data.result, executionTime, data.from_cache || false);
+            // Pass ONLY backend-provided values - NO client-side calculation
+            displayResults(data.result, executionTime, fromCache);
         } else {
             stopExecutionTimer();
             showError(data.error || 'Failed to fetch query result');
@@ -352,6 +389,8 @@ async function fetchQueryResult(queryId) {
         showError('Failed to fetch query result: ' + error.message);
     } finally {
         currentQueryId = null;
+        // Reset executionStartTime after result is displayed
+        executionStartTime = null;
     }
 }
 
@@ -378,6 +417,7 @@ function displayProgress(progress) {
     const resultsContainer = document.getElementById('results-container');
     
     // Calculate elapsed time for display
+    // Defensive check: ensure executionStartTime is valid before calculating
     const elapsed = executionStartTime ? (performance.now() - executionStartTime) : 0;
     const elapsedFormatted = formatExecutionTime(elapsed);
     
@@ -458,6 +498,28 @@ function formatTimeEstimate(seconds) {
 function updateExecutionTimer() {
     if (!executionStartTime) return;
     
+    // CRITICAL: Don't update if results have already been displayed
+    // Check flag first, then check DOM
+    if (resultsDisplayed) {
+        stopExecutionTimer();
+        return;
+    }
+    
+    const resultsContainer = document.getElementById('results-container');
+    if (resultsContainer) {
+        const hasResults = resultsContainer.querySelector('.results-table');
+        const hasExecutionTime = Array.from(resultsContainer.querySelectorAll('.info-message')).some(
+            msg => msg.textContent.includes('EXECUTION TIME')
+        );
+        if (hasResults || hasExecutionTime) {
+            // Results already displayed with backend-provided execution time
+            // Stop timer to prevent overwriting
+            resultsDisplayed = true;
+            stopExecutionTimer();
+            return;
+        }
+    }
+    
     const elapsed = performance.now() - executionStartTime;
     const elapsedFormatted = formatExecutionTime(elapsed);
     
@@ -468,8 +530,6 @@ function updateExecutionTimer() {
     }
     
     // For synchronous queries, update the loading display
-    const resultsContainer = document.getElementById('results-container');
-    
     const loadingDiv = document.createElement('div');
     loadingDiv.className = 'loading';
     loadingDiv.innerHTML = `
@@ -491,15 +551,40 @@ function displayResults(result, executionTime, fromCache) {
     const resultsContainer = document.getElementById('results-container');
     const MAX_DISPLAY_ROWS = 1000;
     
+    // CRITICAL: executionTime MUST be the backend-provided execution_time_ms value in milliseconds
+    // fromCache MUST be the backend-provided from_cache boolean value
+    // These values come directly from the API response, NOT from client-side timing
+    
+    // Set flag and stop timer to prevent overwriting
+    resultsDisplayed = true;
+    stopExecutionTimer();
+    
+    // Debug: Log what we're displaying
+    console.log('displayResults - displaying backend values:', {
+        'executionTime (ms from backend)': executionTime,
+        'fromCache (from backend)': fromCache,
+        'formatted time': formatExecutionTime(executionTime)
+    });
+    
     if (!result.columns || result.columns.length === 0) {
         const cacheText = fromCache ? ' • Cache used' : '';
-        resultsContainer.innerHTML = `<div class="info-message">Query executed successfully (no columns) - Execution time: ${formatExecutionTime(executionTime)}${cacheText}</div>`;
+        resultsContainer.innerHTML = `
+            <div class="execution-info-widget">
+                <span class="execution-time">⏱️ ${formatExecutionTime(executionTime)}</span>
+                ${fromCache ? '<span class="cache-badge">Cache used</span>' : ''}
+            </div>
+            <div class="info-message">Query executed successfully (no columns)</div>`;
         return;
     }
     
     if (!result.rows || result.rows.length === 0) {
         const cacheText = fromCache ? ' • Cache used' : '';
-        resultsContainer.innerHTML = `<div class="info-message">Query executed successfully (0 rows returned) - Execution time: ${formatExecutionTime(executionTime)}${cacheText}</div>`;
+        resultsContainer.innerHTML = `
+            <div class="execution-info-widget">
+                <span class="execution-time">⏱️ ${formatExecutionTime(executionTime)}</span>
+                ${fromCache ? '<span class="cache-badge">Cache used</span>' : ''}
+            </div>
+            <div class="info-message">Query executed successfully (0 rows returned)</div>`;
         return;
     }
     
@@ -509,10 +594,10 @@ function displayResults(result, executionTime, fromCache) {
     
     let html = '';
     
-    // Show execution time and cache status in a single box
-    const cacheText = fromCache ? ' • Cache used' : '';
-    html += `<div class="info-message" style="margin-bottom: 15px;">
-        <strong>⏱️ EXECUTION TIME:</strong> ${formatExecutionTime(executionTime)}${cacheText}
+    // Show execution time and cache status widget
+    html += `<div class="execution-info-widget">
+        <span class="execution-time">⏱️ ${formatExecutionTime(executionTime)}</span>
+        ${fromCache ? '<span class="cache-badge">Cache used</span>' : ''}
     </div>`;
     
     // Show warning if results are truncated

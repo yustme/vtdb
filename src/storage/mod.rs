@@ -563,6 +563,28 @@ impl StorageEngine {
     pub fn iceberg_catalog_mut(&mut self) -> Option<&mut iceberg::catalog::IcebergCatalog> {
         self.iceberg_catalog.as_mut()
     }
+
+    /// Drop all tables from memory and storage
+    pub fn drop_all_tables(&mut self) -> Result<()> {
+        // Get list of table names before clearing
+        let table_names: Vec<String> = self.tables.keys().cloned().collect();
+
+        // Clear in-memory tables
+        self.tables.clear();
+
+        // Clear indexes
+        self.index_manager.clear_all();
+
+        // Clear WAL
+        self.wal = wal::WAL::new();
+
+        // Delete all Iceberg tables from disk
+        if let Some(catalog) = &mut self.iceberg_catalog {
+            catalog.drop_all_tables()?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for StorageEngine {

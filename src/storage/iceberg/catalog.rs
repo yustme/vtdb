@@ -237,6 +237,27 @@ impl IcebergCatalog {
         
         tables
     }
+
+    /// Drop all tables from Iceberg storage (delete directories from disk)
+    pub fn drop_all_tables(&mut self) -> Result<()> {
+        let table_names = self.list_tables();
+        
+        for table_name in table_names {
+            let table_path = self.get_table_path(&table_name);
+            if table_path.exists() {
+                // Remove entire table directory (includes data/ and metadata/)
+                if let Err(e) = fs::remove_dir_all(&table_path) {
+                    eprintln!("Warning: Failed to delete table directory {:?}: {}", table_path, e);
+                    // Continue with other tables even if one fails
+                }
+            }
+        }
+
+        // Clear internal table metadata cache
+        self.tables.clear();
+
+        Ok(())
+    }
 }
 
 impl Default for TableMetadata {

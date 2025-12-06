@@ -10,6 +10,7 @@ pub enum Statement {
     Insert(Insert),
     Update(Update),
     Delete(Delete),
+    DropAllTables(DropAllTables),
 }
 
 impl Hash for Statement {
@@ -34,6 +35,9 @@ impl Hash for Statement {
             Statement::Delete(delete) => {
                 4u8.hash(state);
                 delete.hash(state);
+            }
+            Statement::DropAllTables(_) => {
+                5u8.hash(state);
             }
         }
     }
@@ -337,6 +341,17 @@ impl Hash for Delete {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.table.hash(state);
         self.where_clause.hash(state);
+    }
+}
+
+/// DROP ALL TABLES statement
+#[derive(Debug, Clone)]
+pub struct DropAllTables;
+
+impl Hash for DropAllTables {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Empty struct, just hash a constant
+        0u8.hash(state);
     }
 }
 

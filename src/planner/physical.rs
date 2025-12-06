@@ -28,5 +28,6 @@ pub enum PhysicalPlan {
         table: String,
         filter: Option<Expr>,
     },
+    DropAllTables,
 }
 
