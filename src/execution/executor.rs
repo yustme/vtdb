@@ -210,46 +210,109 @@ impl Executor {
         storage: &mut StorageEngine,
         catalog: &Catalog,
     ) -> Result<QueryResult> {
+        // Extract needed column indices for column projection (only for single table scans)
+        let column_indices = match from {
+            crate::parser::ast::TableRef::Table { name, .. } => {
+                self.extract_needed_column_indices(name, columns, filter, group_by, catalog)
+            }
+            _ => None, // For JOINs, we need all columns
+        };
+
         // Try to use index scan for single table queries with filters
         let (all_rows, combined_schema) = match (from, filter) {
             (crate::parser::ast::TableRef::Table { name, alias }, Some(filter_expr)) => {
-                // Check if we can use an index
-                if let Some((column_name, key_value)) = self.extract_equality_predicate(filter_expr) {
-                    // Flush buffer before index scan to ensure latest data is visible
-                    if storage.has_pending_buffer_data(name) {
-                        if let Err(e) = storage.flush_table_iceberg_writes(name) {
-                            eprintln!("Warning: Failed to flush buffer before index scan for table {}: {}", name, e);
-                        }
+                // Flush buffer before index scan to ensure latest data is visible
+                if storage.has_pending_buffer_data(name) {
+                    if let Err(e) = storage.flush_table_iceberg_writes(name) {
+                        eprintln!("Warning: Failed to flush buffer before index scan for table {}: {}", name, e);
                     }
-                    // Try to use index for equality lookup
+                }
+
+                // Try equality predicate first (works with both hash and B-tree indexes)
+                if let Some((column_name, key_value)) = self.extract_equality_predicate(filter_expr) {
                     use crate::execution::operators::IndexScan;
                     let row_ids = IndexScan::scan_by_key(name, &column_name, key_value, storage)?;
                     if !row_ids.is_empty() {
-                        // Use index scan
+                        // Use index scan - for index scans, we still need all columns
+                        // because we're fetching by row ID and need full rows
                         let rows = IndexScan::get_rows_by_ids(name, &row_ids, storage)?;
                         let schema = catalog.get_table(name)?;
                         let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
                         return self.finish_select_execution_sync(rows, &combined_schema, columns, filter, group_by, limit);
                     }
                 }
-                // Fall back to regular scan
-                self.execute_table_ref(from, storage, catalog)?
+
+                // Try range predicate (only works with B-tree indexes)
+                if let Some((column_name, min_val, max_val, _min_inclusive, _max_inclusive)) = self.extract_range_predicate(filter_expr) {
+                    use crate::execution::operators::IndexScan;
+                    let index_manager = storage.index_manager();
+                    // Check if column has a B-tree index
+                    if let Some(index) = index_manager.get_index(name, &column_name) {
+                        if index.index_type() == crate::index::IndexType::BTree {
+                            // Determine min and max values for range query
+                            // For range queries, we need to handle unbounded ranges
+                            // B-tree range_query expects both min and max, so we use Value bounds
+                            let min_bound = min_val.unwrap_or_else(|| {
+                                // No lower bound - use minimum value
+                                crate::Value::Integer(i64::MIN)
+                            });
+                            let max_bound = max_val.unwrap_or_else(|| {
+                                // No upper bound - use maximum value
+                                crate::Value::Integer(i64::MAX)
+                            });
+
+                            // Use inclusive bounds (B-tree range_query uses inclusive)
+                            let row_ids = IndexScan::scan_by_range(name, &column_name, min_bound.clone(), max_bound.clone(), storage)?;
+                            if !row_ids.is_empty() {
+                                // Use index scan
+                                let rows = IndexScan::get_rows_by_ids(name, &row_ids, storage)?;
+                                let schema = catalog.get_table(name)?;
+                                let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
+                                // Still need to apply filter to handle exclusive bounds and other conditions
+                                return self.finish_select_execution_sync(rows, &combined_schema, columns, filter, group_by, limit);
+                            }
+                        }
+                    }
+                }
+
+                // Fall back to regular scan with column projection
+                // For queries with WHERE clause, we need to scan rows to filter them
+                // We can use a hint limit (limit * multiplier) to reduce scanning when possible
+                // but still need to scan enough to find LIMIT matching rows
+                let hint_limit = limit.map(|l| {
+                    // Use a multiplier to scan more rows than needed to account for filtering
+                    // This reduces I/O while still ensuring we can find LIMIT matching rows
+                    l * 10 // Scan up to 10x the limit to find matching rows
+                });
+                self.execute_table_ref_with_projection(from, storage, catalog, column_indices.as_deref(), hint_limit)?
             }
             _ => {
                 // Execute JOINs or single table scan without filter
-                self.execute_table_ref(from, storage, catalog)?
+                // For single table without filter, use column projection and early LIMIT
+                self.execute_table_ref_with_projection(from, storage, catalog, column_indices.as_deref(), *limit)?
             }
         };
 
-        // Apply filter
+        // Apply filter with early LIMIT if no WHERE clause was used
+        // If there's a WHERE clause, we need to filter all rows first, then apply LIMIT
         let filtered_rows = if let Some(filter_expr) = filter {
-            all_rows
-                .into_iter()
-                .filter(|row| {
-                    self.evaluate_predicate_with_schema(filter_expr, row, &combined_schema).unwrap_or(false)
-                })
-                .collect()
+            // For queries with WHERE clause, apply LIMIT during filtering to stop early
+            let limit_usize = limit.map(|l| l as usize);
+            let mut result = Vec::new();
+            for row in all_rows {
+                if self.evaluate_predicate_with_schema(filter_expr, &row, &combined_schema).unwrap_or(false) {
+                    result.push(row);
+                    // Stop early if we've reached the LIMIT
+                    if let Some(limit_val) = limit_usize {
+                        if result.len() >= limit_val {
+                            break;
+                        }
+                    }
+                }
+            }
+            result
         } else {
+            // No WHERE clause - LIMIT was already applied during scan (if applicable)
             all_rows
         };
 
@@ -299,15 +362,15 @@ impl Executor {
         // Try to use index scan for single table queries with filters
         let (all_rows, combined_schema) = match (from, filter) {
             (crate::parser::ast::TableRef::Table { name, alias }, Some(filter_expr)) => {
-                // Check if we can use an index
-                if let Some((column_name, key_value)) = self.extract_equality_predicate(filter_expr) {
-                    // Flush buffer before index scan to ensure latest data is visible
-                    if storage.has_pending_buffer_data(name) {
-                        if let Err(e) = storage.flush_table_iceberg_writes(name) {
-                            eprintln!("Warning: Failed to flush buffer before index scan for table {}: {}", name, e);
-                        }
+                // Flush buffer before index scan to ensure latest data is visible
+                if storage.has_pending_buffer_data(name) {
+                    if let Err(e) = storage.flush_table_iceberg_writes(name) {
+                        eprintln!("Warning: Failed to flush buffer before index scan for table {}: {}", name, e);
                     }
-                    // Try to use index for equality lookup
+                }
+
+                // Try equality predicate first (works with both hash and B-tree indexes)
+                if let Some((column_name, key_value)) = self.extract_equality_predicate(filter_expr) {
                     use crate::execution::operators::IndexScan;
                     let row_ids = IndexScan::scan_by_key(name, &column_name, key_value, storage)?;
                     if !row_ids.is_empty() {
@@ -318,7 +381,33 @@ impl Executor {
                         return self.finish_select_execution(rows, &combined_schema, columns, filter, group_by, limit, Some(&active_queries), Some(query_id)).await;
                     }
                 }
-                // Fall back to chunked scan
+
+                // Try range predicate (only works with B-tree indexes)
+                if let Some((column_name, min_val, max_val, _min_inclusive, _max_inclusive)) = self.extract_range_predicate(filter_expr) {
+                    use crate::execution::operators::IndexScan;
+                    let index_manager = storage.index_manager();
+                    // Check if column has a B-tree index
+                    if let Some(index) = index_manager.get_index(name, &column_name) {
+                        if index.index_type() == crate::index::IndexType::BTree {
+                            // Determine min and max values for range query
+                            let min_bound = min_val.unwrap_or_else(|| crate::Value::Integer(i64::MIN));
+                            let max_bound = max_val.unwrap_or_else(|| crate::Value::Integer(i64::MAX));
+
+                            // Use inclusive bounds (B-tree range_query uses inclusive)
+                            let row_ids = IndexScan::scan_by_range(name, &column_name, min_bound.clone(), max_bound.clone(), storage)?;
+                            if !row_ids.is_empty() {
+                                // Use index scan
+                                let rows = IndexScan::get_rows_by_ids(name, &row_ids, storage)?;
+                                let schema = catalog.get_table(name)?;
+                                let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
+                                // Still need to apply filter to handle exclusive bounds and other conditions
+                                return self.finish_select_execution(rows, &combined_schema, columns, filter, group_by, limit, Some(&active_queries), Some(query_id)).await;
+                            }
+                        }
+                    }
+                }
+
+                // Fall back to chunked scan (LIMIT will be applied later)
                 self.execute_table_ref_with_progress(from, storage, catalog, &active_queries, query_id, CHUNK_SIZE).await?
             }
             _ => {
@@ -440,6 +529,201 @@ impl Executor {
         }
     }
 
+    /// Extract range predicate (column < value, column > value, etc.) for B-tree index lookup
+    /// Returns (column_name, min_value, max_value, min_inclusive, max_inclusive)
+    fn extract_range_predicate(&self, expr: &crate::parser::ast::Expr) -> Option<(String, Option<Value>, Option<Value>, bool, bool)> {
+        match expr {
+            crate::parser::ast::Expr::BinaryOp { left, op, right } => {
+                match op {
+                    crate::parser::ast::BinaryOperator::Lt => {
+                        // column < value
+                        match (left.as_ref(), right.as_ref()) {
+                            (crate::parser::ast::Expr::Column(col), crate::parser::ast::Expr::Literal(val)) => {
+                                Some((col.clone(), None, Some(val.clone()), false, false))
+                            }
+                            (crate::parser::ast::Expr::QualifiedColumn { table: _, column }, crate::parser::ast::Expr::Literal(val)) => {
+                                Some((column.clone(), None, Some(val.clone()), false, false))
+                            }
+                            (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::Column(col)) => {
+                                // value < column -> column > value
+                                Some((col.clone(), Some(val.clone()), None, false, false))
+                            }
+                            (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::QualifiedColumn { table: _, column }) => {
+                                Some((column.clone(), Some(val.clone()), None, false, false))
+                            }
+                            _ => None,
+                        }
+                    }
+                    crate::parser::ast::BinaryOperator::Gt => {
+                        // column > value
+                        match (left.as_ref(), right.as_ref()) {
+                            (crate::parser::ast::Expr::Column(col), crate::parser::ast::Expr::Literal(val)) => {
+                                Some((col.clone(), Some(val.clone()), None, false, false))
+                            }
+                            (crate::parser::ast::Expr::QualifiedColumn { table: _, column }, crate::parser::ast::Expr::Literal(val)) => {
+                                Some((column.clone(), Some(val.clone()), None, false, false))
+                            }
+                            (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::Column(col)) => {
+                                // value > column -> column < value
+                                Some((col.clone(), None, Some(val.clone()), false, false))
+                            }
+                            (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::QualifiedColumn { table: _, column }) => {
+                                Some((column.clone(), None, Some(val.clone()), false, false))
+                            }
+                            _ => None,
+                        }
+                    }
+                    crate::parser::ast::BinaryOperator::Le => {
+                        // column <= value
+                        match (left.as_ref(), right.as_ref()) {
+                            (crate::parser::ast::Expr::Column(col), crate::parser::ast::Expr::Literal(val)) => {
+                                Some((col.clone(), None, Some(val.clone()), false, true))
+                            }
+                            (crate::parser::ast::Expr::QualifiedColumn { table: _, column }, crate::parser::ast::Expr::Literal(val)) => {
+                                Some((column.clone(), None, Some(val.clone()), false, true))
+                            }
+                            (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::Column(col)) => {
+                                // value <= column -> column >= value
+                                Some((col.clone(), Some(val.clone()), None, true, false))
+                            }
+                            (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::QualifiedColumn { table: _, column }) => {
+                                Some((column.clone(), Some(val.clone()), None, true, false))
+                            }
+                            _ => None,
+                        }
+                    }
+                    crate::parser::ast::BinaryOperator::Ge => {
+                        // column >= value
+                        match (left.as_ref(), right.as_ref()) {
+                            (crate::parser::ast::Expr::Column(col), crate::parser::ast::Expr::Literal(val)) => {
+                                Some((col.clone(), Some(val.clone()), None, true, false))
+                            }
+                            (crate::parser::ast::Expr::QualifiedColumn { table: _, column }, crate::parser::ast::Expr::Literal(val)) => {
+                                Some((column.clone(), Some(val.clone()), None, true, false))
+                            }
+                            (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::Column(col)) => {
+                                // value >= column -> column <= value
+                                Some((col.clone(), None, Some(val.clone()), false, true))
+                            }
+                            (crate::parser::ast::Expr::Literal(val), crate::parser::ast::Expr::QualifiedColumn { table: _, column }) => {
+                                Some((column.clone(), None, Some(val.clone()), false, true))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract column names from an expression (for column projection)
+    fn extract_column_names_from_expr(&self, expr: &crate::parser::ast::Expr) -> Vec<String> {
+        let mut columns = Vec::new();
+        match expr {
+            crate::parser::ast::Expr::Column(col) => {
+                columns.push(col.clone());
+            }
+            crate::parser::ast::Expr::QualifiedColumn { table: _, column } => {
+                columns.push(column.clone());
+            }
+            crate::parser::ast::Expr::Literal(_) => {
+                // No columns in literals
+            }
+            crate::parser::ast::Expr::BinaryOp { left, right, .. } => {
+                columns.extend(self.extract_column_names_from_expr(left));
+                columns.extend(self.extract_column_names_from_expr(right));
+            }
+        }
+        columns
+    }
+
+    /// Extract needed column indices for a table from SELECT items, WHERE clause, and GROUP BY
+    /// Returns column indices in the order they appear in the table schema
+    fn extract_needed_column_indices(
+        &self,
+        table_name: &str,
+        columns: &[crate::parser::ast::SelectItem],
+        filter: &Option<crate::parser::ast::Expr>,
+        group_by: &Option<Vec<String>>,
+        catalog: &Catalog,
+    ) -> Option<Vec<usize>> {
+        let table_schema = catalog.get_table(table_name).ok()?;
+        let mut needed_columns = std::collections::HashSet::new();
+
+        // Extract from SELECT items
+        for col_item in columns {
+            match col_item {
+                crate::parser::ast::SelectItem::Column(col_name) => {
+                    // Handle qualified column names (table.column)
+                    if col_name.contains('.') {
+                        let parts: Vec<&str> = col_name.split('.').collect();
+                        if parts.len() == 2 && parts[0] == table_name {
+                            needed_columns.insert(parts[1].to_string());
+                        }
+                    } else {
+                        needed_columns.insert(col_name.clone());
+                    }
+                }
+                crate::parser::ast::SelectItem::All => {
+                    // SELECT * - need all columns
+                    return None;
+                }
+                crate::parser::ast::SelectItem::FunctionCall { function, .. } => {
+                    // Extract columns from aggregate function expressions
+                    match function {
+                        crate::parser::ast::AggregateFunction::Count { expr, .. } => {
+                            if let Some(expr) = expr {
+                                needed_columns.extend(self.extract_column_names_from_expr(expr));
+                            }
+                        }
+                        crate::parser::ast::AggregateFunction::Sum { expr, .. } |
+                        crate::parser::ast::AggregateFunction::Avg { expr, .. } => {
+                            needed_columns.extend(self.extract_column_names_from_expr(expr));
+                        }
+                        crate::parser::ast::AggregateFunction::Min { expr } |
+                        crate::parser::ast::AggregateFunction::Max { expr } => {
+                            needed_columns.extend(self.extract_column_names_from_expr(expr));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Extract from WHERE clause
+        if let Some(filter_expr) = filter {
+            needed_columns.extend(self.extract_column_names_from_expr(filter_expr));
+        }
+
+        // Extract from GROUP BY
+        if let Some(group_by_cols) = group_by {
+            needed_columns.extend(group_by_cols.iter().cloned());
+        }
+
+        // Map column names to indices, preserving table schema order
+        let mut column_indices: Vec<usize> = table_schema.columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                if needed_columns.contains(&col.name) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // If we need all columns (SELECT *), return None to read all
+        if column_indices.len() == table_schema.column_count() {
+            return None;
+        }
+
+        // Column indices are already in schema order, no need to sort
+        
+        Some(column_indices)
+    }
+
     /// Execute a TableRef (table or JOIN) and return rows with combined schema
     fn execute_table_ref(
         &self,
@@ -447,16 +731,34 @@ impl Executor {
         storage: &mut StorageEngine,
         catalog: &Catalog,
     ) -> Result<(Vec<Vec<Value>>, CombinedSchema)> {
+        self.execute_table_ref_with_projection(table_ref, storage, catalog, None, None)
+    }
+
+    /// Execute a TableRef with optional column projection and LIMIT
+    fn execute_table_ref_with_projection(
+        &self,
+        table_ref: &crate::parser::ast::TableRef,
+        storage: &mut StorageEngine,
+        catalog: &Catalog,
+        column_indices: Option<&[usize]>,
+        limit: Option<u64>,
+    ) -> Result<(Vec<Vec<Value>>, CombinedSchema)> {
         match table_ref {
             crate::parser::ast::TableRef::Table { name, alias } => {
                 let schema = catalog.get_table(name)?;
-                // Try to use index scan if filter is present and indexable
-                // For now, we'll scan all rows - index optimization will be added in execute_select
-                let rows = storage.scan_table(name)?;
+                // Use column projection if provided, with early LIMIT
+                let rows = if let Some(indices) = column_indices {
+                    storage.scan_table_with_projection_and_limit(name, Some(indices), limit)?
+                } else {
+                    storage.scan_table_with_limit(name, limit)?
+                };
                 let combined_schema = CombinedSchema::from_single_table(schema, alias.clone())?;
                 Ok((rows, combined_schema))
             }
             crate::parser::ast::TableRef::Join { left, right, join_type, condition } => {
+                // For JOINs, we can't use column projection easily since we need all columns
+                // to perform the join. Column projection will be applied after the join.
+                // LIMIT also can't be applied early for JOINs since we need all matching rows.
                 self.execute_join(left, right, join_type, condition, storage, catalog)
             }
         }
@@ -518,7 +820,7 @@ impl Executor {
                 Ok((all_rows, combined_schema))
             }
             crate::parser::ast::TableRef::Join { left, right, join_type, condition } => {
-                // For JOINs, recursively scan with progress
+                // For JOINs, recursively scan with progress (no early LIMIT for JOINs - need all rows)
                 // Process left side first
                 let (left_rows, left_schema) = self.execute_table_ref_with_progress(
                     left, storage, catalog, active_queries, query_id, chunk_size

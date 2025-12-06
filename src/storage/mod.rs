@@ -704,6 +704,37 @@ impl StorageEngine {
 
     /// Scan all rows from a table
     pub fn scan_table(&mut self, table_name: &str) -> Result<Vec<Vec<Value>>> {
+        self.scan_table_with_projection(table_name, None)
+    }
+
+    /// Scan all rows from a table with optional column projection
+    /// When projection is used, rows are reconstructed to match the full schema
+    pub fn scan_table_with_projection(
+        &mut self,
+        table_name: &str,
+        column_indices: Option<&[usize]>,
+    ) -> Result<Vec<Vec<Value>>> {
+        self.scan_table_with_projection_and_limit(table_name, column_indices, None)
+    }
+
+    /// Scan rows from a table with optional column projection and LIMIT
+    /// Stops scanning once LIMIT rows are found (for early termination)
+    pub fn scan_table_with_limit(
+        &mut self,
+        table_name: &str,
+        limit: Option<u64>,
+    ) -> Result<Vec<Vec<Value>>> {
+        self.scan_table_with_projection_and_limit(table_name, None, limit)
+    }
+
+    /// Scan rows from a table with optional column projection and LIMIT
+    /// Stops scanning once LIMIT rows are found (for early termination)
+    pub fn scan_table_with_projection_and_limit(
+        &mut self,
+        table_name: &str,
+        column_indices: Option<&[usize]>,
+        limit: Option<u64>,
+    ) -> Result<Vec<Vec<Value>>> {
         // Flush any pending buffers before reading to ensure latest data is visible
         if self.has_pending_buffer_data(table_name) {
             if let Err(e) = self.flush_iceberg_buffer(table_name) {
@@ -715,27 +746,60 @@ impl StorageEngine {
         // If table exists in memory, always use it (it may have uncommitted changes like updates/deletes)
         // Only read from Iceberg if table doesn't exist in memory at all
         if let Some(table) = self.tables.get(table_name) {
-            return Ok(table.scan_all());
-        }
-
-        // Table doesn't exist in memory, try to read from Iceberg
-        if let Some(catalog) = &self.iceberg_catalog {
-            if catalog.table_exists(table_name) {
-                if let Ok(rows) = self.read_from_iceberg(table_name) {
-                    return Ok(rows);
+            // For in-memory tables, apply LIMIT early
+            if let Some(limit_val) = limit {
+                let limit_usize = limit_val as usize;
+                let all_rows = table.scan_all();
+                Ok(all_rows.into_iter().take(limit_usize).collect())
+            } else {
+                Ok(table.scan_all())
+            }
+        } else {
+            // Table doesn't exist in memory, try to read from Iceberg with projection and LIMIT
+            if let Some(catalog) = &self.iceberg_catalog {
+                if catalog.table_exists(table_name) {
+                    if let Ok(rows) = self.read_from_iceberg_with_projection_and_limit(table_name, column_indices, limit) {
+                        return Ok(rows);
+                    }
                 }
             }
-        }
 
-        // Table not found anywhere
-        Err(anyhow::anyhow!("Table '{}' not found", table_name))
+            // Table not found anywhere
+            Err(anyhow::anyhow!("Table '{}' not found", table_name))
+        }
     }
 
     /// Read rows from Iceberg storage
     fn read_from_iceberg(&self, table_name: &str) -> Result<Vec<Vec<Value>>> {
+        self.read_from_iceberg_with_projection(table_name, None)
+    }
+
+    /// Read rows from Iceberg storage with optional column projection
+    fn read_from_iceberg_with_projection(
+        &self,
+        table_name: &str,
+        column_indices: Option<&[usize]>,
+    ) -> Result<Vec<Vec<Value>>> {
+        self.read_from_iceberg_with_projection_and_limit(table_name, column_indices, None)
+    }
+
+    /// Read rows from Iceberg storage with optional column projection and LIMIT
+    /// Stops reading once LIMIT rows are found (for early termination)
+    fn read_from_iceberg_with_projection_and_limit(
+        &self,
+        table_name: &str,
+        column_indices: Option<&[usize]>,
+        limit: Option<u64>,
+    ) -> Result<Vec<Vec<Value>>> {
         let catalog = self.iceberg_catalog.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Iceberg catalog not initialized")
         })?;
+
+        // Get table metadata to know total column count for row reconstruction
+        let total_column_count = catalog.get_table_metadata(table_name)
+            .ok()
+            .map(|m| m.schema.field_count())
+            .unwrap_or(0);
 
         let metadata_dir = catalog.get_metadata_dir(table_name);
         let manifest_manager = iceberg::manifest::ManifestManager::new(&metadata_dir);
@@ -786,9 +850,9 @@ impl StorageEngine {
         // Use a set to track which files we've already read (to avoid duplicates)
         use std::collections::HashSet;
         let mut read_files = HashSet::new();
-        let mut all_rows = Vec::new();
+        let mut file_paths_to_read = Vec::new();
 
-        // Read each manifest referenced in the manifest list
+        // Collect all file paths to read first
         for entry in manifest_entries {
             let manifest_path = entry.manifest_path;
             if let Ok(manifest) = manifest_manager.read_manifest(&manifest_path) {
@@ -816,38 +880,116 @@ impl StorageEngine {
                             }
                         };
 
-                        // Try to read the file
                         if file_path.exists() {
-                            match iceberg::parquet_reader::ParquetReader::read_rows(&file_path) {
-                                Ok(rows) => {
-                                    all_rows.extend(rows);
-                                }
-                                Err(e) => {
-                                    eprintln!("Warning: Failed to read Parquet file {:?}: {}", file_path, e);
-                                    // Continue with other files
-                                }
-                            }
+                            file_paths_to_read.push(file_path);
                         } else {
                             // Try alternative: just the filename in the data directory
                             if let Some(file_name) = std::path::Path::new(&data_file.file_path).file_name() {
                                 let alt_path = catalog.get_data_dir(table_name).join(file_name);
                                 if alt_path.exists() {
-                                    match iceberg::parquet_reader::ParquetReader::read_rows(&alt_path) {
-                                        Ok(rows) => {
-                                            all_rows.extend(rows);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Warning: Failed to read Parquet file {:?}: {}", alt_path, e);
-                                        }
-                                    }
+                                    file_paths_to_read.push(alt_path);
                                 }
                             }
                         }
                     }
                 }
-                
-                // Note: We don't process deleted_files here because we're reading all files
-                // Deleted files would be handled by snapshot isolation in a full implementation
+            }
+        }
+
+        // Create a mapping from projected column index to original column index
+        // This is used to reconstruct full rows from projected rows
+        let projection_map: Option<Vec<(usize, usize)>> = column_indices.map(|indices| {
+            indices.iter().enumerate().map(|(proj_idx, &orig_idx)| (proj_idx, orig_idx)).collect()
+        });
+
+        // Read files in parallel using threads
+        use std::sync::mpsc;
+        use std::thread;
+        
+        let (tx, rx) = mpsc::channel();
+        let projection_map_clone = projection_map.clone();
+        let column_indices_clone = column_indices.map(|indices| indices.to_vec());
+        
+        // Determine number of threads (use number of CPU cores, but cap at number of files)
+        let num_threads = std::cmp::min(
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1),
+            file_paths_to_read.len().max(1)
+        );
+        let files_per_thread = (file_paths_to_read.len() + num_threads - 1) / num_threads.max(1);
+        
+        // Spawn threads to read files in parallel
+        for chunk in file_paths_to_read.chunks(files_per_thread.max(1)) {
+            let tx = tx.clone();
+            let chunk = chunk.to_vec();
+            let projection_map_thread = projection_map_clone.clone();
+            let column_indices_thread = column_indices_clone.clone();
+            let total_column_count_thread = total_column_count;
+            
+            thread::spawn(move || {
+                let mut chunk_results = Vec::new();
+                for file_path in chunk {
+                    match (&column_indices_thread, &projection_map_thread) {
+                        (Some(indices), Some(map)) if total_column_count_thread > 0 => {
+                            // Use column projection and reconstruct full rows
+                            match iceberg::parquet_reader::ParquetReader::read_rows_projected(&file_path, indices) {
+                                Ok(projected_rows) => {
+                                    // Reconstruct full rows: create rows with nulls for missing columns
+                                    let full_rows: Vec<Vec<Value>> = projected_rows.into_iter().map(|proj_row| {
+                                        let mut full_row = vec![crate::Value::Null; total_column_count_thread];
+                                        // Fill in projected values at their original positions
+                                        for &(proj_idx, orig_idx) in map.iter() {
+                                            if proj_idx < proj_row.len() && orig_idx < full_row.len() {
+                                                full_row[orig_idx] = proj_row[proj_idx].clone();
+                                            }
+                                        }
+                                        full_row
+                                    }).collect();
+                                    chunk_results.extend(full_rows);
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: Failed to read Parquet file {:?} with projection: {}", file_path, e);
+                                    // Fall back to reading all columns
+                                    if let Ok(rows) = iceberg::parquet_reader::ParquetReader::read_rows(&file_path) {
+                                        chunk_results.extend(rows);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Read all columns (no projection or reconstruction needed)
+                            if let Ok(rows) = iceberg::parquet_reader::ParquetReader::read_rows(&file_path) {
+                                chunk_results.extend(rows);
+                            } else {
+                                eprintln!("Warning: Failed to read Parquet file {:?}", file_path);
+                            }
+                        }
+                    }
+                }
+                tx.send(chunk_results).unwrap_or_default();
+            });
+        }
+        
+        drop(tx); // Close sender so receiver knows when to stop
+        
+        // Collect results from all threads, stopping early if LIMIT is reached
+        let mut all_rows = Vec::new();
+        let limit_usize = limit.map(|l| l as usize);
+        
+        while let Ok(rows) = rx.recv() {
+            if let Some(limit_val) = limit_usize {
+                // Check if we need more rows
+                let remaining = limit_val.saturating_sub(all_rows.len());
+                if remaining == 0 {
+                    break; // Already have enough rows
+                }
+                // Take only what we need
+                let needed_rows: Vec<Vec<Value>> = rows.into_iter().take(remaining).collect();
+                all_rows.extend(needed_rows);
+                if all_rows.len() >= limit_val {
+                    break; // Reached LIMIT
+                }
+            } else {
+                all_rows.extend(rows);
             }
         }
 
