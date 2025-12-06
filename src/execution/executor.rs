@@ -169,8 +169,8 @@ impl Executor {
         let column_defs: Vec<(String, crate::catalog::types::DataType)> = columns.to_vec();
         catalog.create_table(name.to_string(), column_defs.clone())?;
 
-        // Create in storage
-        storage.create_table(name.to_string(), columns.len())?;
+        // Create in storage (with Iceberg support)
+        storage.create_table_with_schema(name.to_string(), column_defs)?;
 
         // Automatically create indexes on all columns (start with hash indexes)
         let index_manager = storage.index_manager_mut();

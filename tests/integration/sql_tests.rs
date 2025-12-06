@@ -1,15 +1,16 @@
 use vtdb::{Database, Value};
+use crate::test_utils::create_test_db;
 
 #[test]
 fn test_create_table() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     let result = db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)");
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_insert_and_select() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     // Create table
     db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
@@ -36,7 +37,7 @@ fn test_insert_and_select() {
 
 #[test]
 fn test_update() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     // Create table
     db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
@@ -59,7 +60,7 @@ fn test_update() {
 
 #[test]
 fn test_delete() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     // Create table
     db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
@@ -83,7 +84,7 @@ fn test_delete() {
 
 #[test]
 fn test_quoted_identifiers() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     // Create table with quoted identifiers
     db.execute(r#"CREATE TABLE "users" ("id" INTEGER, "name" VARCHAR)"#).unwrap();
@@ -98,7 +99,7 @@ fn test_quoted_identifiers() {
 
 #[test]
 fn test_where_clause_operators() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     db.execute("CREATE TABLE numbers (id INTEGER, value INTEGER)").unwrap();
     db.execute("INSERT INTO numbers VALUES (1, 10)").unwrap();
@@ -128,7 +129,7 @@ fn test_where_clause_operators() {
 
 #[test]
 fn test_and_or_operators() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     db.execute("CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER)").unwrap();
     db.execute("INSERT INTO users VALUES (1, 'Alice', 25)").unwrap();
@@ -146,7 +147,7 @@ fn test_and_or_operators() {
 
 #[test]
 fn test_batch_insert_sql() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
     
@@ -171,7 +172,7 @@ fn test_batch_insert_sql() {
 
 #[test]
 fn test_batch_insert_large_dataset() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     db.execute("CREATE TABLE numbers (id INTEGER, value INTEGER)").unwrap();
     
@@ -194,7 +195,7 @@ fn test_batch_insert_large_dataset() {
 
 #[test]
 fn test_batch_insert_with_different_types() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     db.execute("CREATE TABLE mixed (id INTEGER, name VARCHAR, active BOOLEAN)").unwrap();
     
@@ -217,7 +218,7 @@ fn test_batch_insert_with_different_types() {
 
 #[test]
 fn test_batch_insert_performance_verification() {
-    let mut db = Database::new();
+    let mut db = create_test_db();
     
     db.execute("CREATE TABLE perf_test (id INTEGER, data VARCHAR)").unwrap();
     

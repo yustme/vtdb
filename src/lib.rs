@@ -110,27 +110,34 @@ pub struct QueryResultStorage {
 
 /// Main database instance
 pub struct Database {
-    catalog: Catalog,
-    storage: StorageEngine,
-    planner: Planner,
-    executor: Executor,
-    transaction_manager: TransactionManager,
-    cache: QueryCache,
-    active_queries: Arc<Mutex<HashMap<String, QueryProgressTracker>>>,
-    query_results: Arc<Mutex<HashMap<String, QueryResultStorage>>>,
+    pub(crate) catalog: Catalog,
+    pub(crate) storage: StorageEngine,
+    pub(crate) planner: Planner,
+    pub(crate) executor: Executor,
+    pub(crate) transaction_manager: TransactionManager,
+    pub(crate) cache: QueryCache,
+    pub(crate) active_queries: Arc<Mutex<HashMap<String, QueryProgressTracker>>>,
+    pub(crate) query_results: Arc<Mutex<HashMap<String, QueryResultStorage>>>,
 }
 
 impl Database {
-    /// Create a new database instance
-    pub fn new() -> Self {
-        let catalog = Catalog::new();
-        let storage = StorageEngine::new();
+    /// Create a new database instance with custom Iceberg path (for testing only)
+    /// This method is public but intended for test use to ensure tests don't touch production data
+    pub fn with_iceberg_path(iceberg_path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        let iceberg_path = iceberg_path.into();
+        let mut catalog = Catalog::new();
+        let mut storage = StorageEngine::with_iceberg_path(&iceberg_path)?;
         let planner = Planner::new();
         let executor = Executor::new();
         let transaction_manager = TransactionManager::new();
         let cache = QueryCache::default();
 
-        Self {
+        // Load existing tables from Iceberg storage
+        if let Err(e) = Self::load_tables_from_storage(&mut catalog, &mut storage) {
+            eprintln!("Warning: Failed to load some tables from storage: {}", e);
+        }
+
+        let mut db = Self {
             catalog,
             storage,
             planner,
@@ -139,7 +146,80 @@ impl Database {
             cache,
             active_queries: Arc::new(Mutex::new(HashMap::new())),
             query_results: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // Clear cache on startup to avoid stale cached results from previous session
+        db.cache.clear();
+
+        Ok(db)
+    }
+}
+
+impl Database {
+    /// Create a new database instance
+    pub fn new() -> Self {
+        let mut catalog = Catalog::new();
+        let mut storage = StorageEngine::new();
+        let planner = Planner::new();
+        let executor = Executor::new();
+        let transaction_manager = TransactionManager::new();
+        let cache = QueryCache::default();
+
+        // Load existing tables from Iceberg storage
+        if let Err(e) = Self::load_tables_from_storage(&mut catalog, &mut storage) {
+            eprintln!("Warning: Failed to load some tables from storage: {}", e);
         }
+
+        let mut db = Self {
+            catalog,
+            storage,
+            planner,
+            executor,
+            transaction_manager,
+            cache,
+            active_queries: Arc::new(Mutex::new(HashMap::new())),
+            query_results: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // Clear cache on startup to avoid stale cached results from previous session
+        db.cache.clear();
+
+        db
+    }
+
+    /// Load tables from Iceberg storage into catalog
+    pub fn load_tables_from_storage(
+        catalog: &mut Catalog,
+        storage: &mut StorageEngine,
+    ) -> Result<()> {
+        // Ensure Iceberg catalog is initialized
+        let iceberg_catalog = storage.ensure_iceberg_catalog()?;
+        
+        // Discover all tables in the Iceberg catalog
+        let table_names = iceberg_catalog.list_tables();
+        
+        for table_name in table_names {
+            // Skip if already in catalog (shouldn't happen, but be safe)
+            if catalog.table_exists(&table_name) {
+                continue;
+            }
+            
+            // Load metadata from Iceberg
+            if iceberg_catalog.load_table_metadata(&table_name).is_ok() {
+                if let Ok(metadata) = iceberg_catalog.get_table_metadata(&table_name) {
+                    // Convert Iceberg schema to catalog columns
+                    let columns = metadata.schema.to_catalog_columns();
+                    
+                    // Register table in catalog
+                    if catalog.create_table(table_name.clone(), columns).is_err() {
+                        // Table might already exist, continue
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        Ok(())
     }
 
     /// Execute a SQL statement
@@ -567,15 +647,33 @@ impl Value {
 mod tests {
     use super::*;
 
+    // Helper function to create isolated test database
+    fn create_test_database() -> Database {
+        use tempfile::TempDir;
+        use std::sync::Mutex;
+        lazy_static::lazy_static! {
+            static ref TEST_DIRS: Mutex<Vec<TempDir>> = Mutex::new(Vec::new());
+        }
+        
+        let temp_dir = TempDir::new().unwrap();
+        let iceberg_path = temp_dir.path().join("iceberg");
+        std::fs::create_dir_all(&iceberg_path).unwrap();
+        
+        // Keep temp_dir alive for the duration of tests
+        TEST_DIRS.lock().unwrap().push(temp_dir);
+        
+        Database::with_iceberg_path(&iceberg_path).unwrap()
+    }
+
     #[test]
     fn test_database_creation() {
-        let db = Database::new();
+        let db = create_test_database();
         assert!(true); // Database created successfully
     }
 
     #[test]
     fn test_query_cache_hit() {
-        let mut db = Database::new();
+        let mut db = create_test_database();
         
         // Create table and insert data
         db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
@@ -593,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_query_cache_invalidation_on_insert() {
-        let mut db = Database::new();
+        let mut db = create_test_database();
         
         db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
@@ -612,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_query_cache_invalidation_on_update() {
-        let mut db = Database::new();
+        let mut db = create_test_database();
         
         db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
@@ -631,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_query_cache_invalidation_on_delete() {
-        let mut db = Database::new();
+        let mut db = create_test_database();
         
         db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
@@ -651,7 +749,7 @@ mod tests {
 
     #[test]
     fn test_query_cache_table_dependencies() {
-        let mut db = Database::new();
+        let mut db = create_test_database();
         
         db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
         db.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)").unwrap();
@@ -680,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_query_cache_different_queries() {
-        let mut db = Database::new();
+        let mut db = create_test_database();
         
         db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
         db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();

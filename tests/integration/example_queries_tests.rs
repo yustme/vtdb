@@ -162,3 +162,7 @@ fn test_example_queries_with_multiple_inserts() {
     assert_row_count(&result, 3);
 }
 
+
+
+
+
