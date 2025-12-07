@@ -1,0 +1,24 @@
+services:
+  vtdb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vtdb
+    ports:
+      - 8080:8080
+    volumes:
+      # Persist data directory
+      - ./data:/app/data
+      # Mount web directory for easy updates (optional - can be removed if you want static copy)
+      - ./web:/app/web
+    environment:
+      # Add any environment variables here if needed in the future
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+

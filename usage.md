@@ -1,45 +1,31 @@
-# VTDB Usage Guide
+# VTDB Usage Guide for LLMs
 
-This guide explains how to use VTDB (Snowflake-Compatible Database Engine) from external applications and how to generate and load sample datasets.
+This document provides complete information for LLMs to understand how to use VTDB and generate scripts for data loading, querying, and database operations.
 
-## Table of Contents
+## Quick Reference
 
-1. [REST API Usage](#rest-api-usage)
-2. [Library API Usage (Rust)](#library-api-usage-rust)
-3. [SQL Syntax Reference](#sql-syntax-reference)
-4. [Data Types](#data-types)
-5. [Sample Dataset Generation](#sample-dataset-generation)
-6. [Loading Data](#loading-data)
-7. [Performance Optimizations](#performance-optimizations)
+**VTDB Server:** HTTP REST API at `http://localhost:8080`  
+**Main Endpoint:** `POST /api/execute`  
+**Supported Data Types:** INTEGER, VARCHAR, BOOLEAN  
+**SQL Dialect:** Snowflake-compatible  
 
 ---
 
-## REST API Usage
+## API Specification
 
-VTDB provides a REST API endpoint for executing SQL queries. The server runs on `http://localhost:8080` by default.
+### Execute SQL Query
 
-### Starting the Server
+**Endpoint:** `POST http://localhost:8080/api/execute`  
+**Content-Type:** `application/json`
 
-```bash
-cargo run --bin vtdb
-```
-
-The server will start on `http://localhost:8080` and automatically open a web browser with the SQL query interface.
-
-### API Endpoints
-
-#### Execute Query
-
-**Endpoint:** `POST /api/execute`
-
-**Request Format:**
+**Request Body:**
 ```json
 {
   "query": "SQL statement here"
 }
 ```
 
-**Response Format:**
+**Success Response:**
 ```json
 {
   "success": true,
@@ -63,11 +49,11 @@ The server will start on `http://localhost:8080` and automatically open a web br
 }
 ```
 
-#### List Tables
+### List Tables
 
-**Endpoint:** `GET /api/tables`
+**Endpoint:** `GET http://localhost:8080/api/tables`
 
-**Response Format:**
+**Response:**
 ```json
 {
   "success": true,
@@ -76,31 +62,52 @@ The server will start on `http://localhost:8080` and automatically open a web br
 }
 ```
 
-Returns a list of all table names in the database. Used by the web interface table explorer.
+---
 
-### Example: Using cURL
+## Reusable Code Templates
 
-```bash
-# Create a table
-curl -X POST http://localhost:8080/api/execute \
-  -H "Content-Type: application/json" \
-  -d '{"query": "CREATE TABLE users (id INTEGER, name VARCHAR, email VARCHAR)"}'
+### Python Template for Data Loading
 
-# Insert data
-curl -X POST http://localhost:8080/api/execute \
-  -H "Content-Type: application/json" \
-  -d '{"query": "INSERT INTO users VALUES (1, '\''Alice'\'', '\''alice@example.com'\'')"}'
+```python
+import requests
+import json
 
-# Query data
-curl -X POST http://localhost:8080/api/execute \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT * FROM users WHERE id = 1"}'
+# Configuration
+BASE_URL = "http://localhost:8080/api/execute"
 
-# List all tables
-curl -X GET http://localhost:8080/api/tables
+def execute_query(query):
+    """
+    Execute a SQL query against VTDB.
+    
+    Args:
+        query (str): SQL statement to execute
+        
+    Returns:
+        dict: Response from VTDB API
+        
+    Raises:
+        Exception: If query execution fails
+    """
+    response = requests.post(
+        BASE_URL,
+        json={"query": query},
+        headers={"Content-Type": "application/json"}
+    )
+    result = response.json()
+    
+    if not result.get("success", False):
+        error_msg = result.get("error", "Unknown error")
+        raise Exception(f"Query failed: {error_msg}")
+    
+    return result
+
+# Usage pattern:
+# 1. Create table
+# 2. Insert data (loop through rows)
+# 3. Query data (optional)
 ```
 
-### Example: Using Python
+### Complete Python Data Loading Script Template
 
 ```python
 import requests
@@ -114,99 +121,67 @@ def execute_query(query):
         json={"query": query},
         headers={"Content-Type": "application/json"}
     )
-    return response.json()
+    result = response.json()
+    if not result.get("success", False):
+        raise Exception(f"Query failed: {result.get('error')}")
+    return result
 
-# Create table
-result = execute_query("CREATE TABLE users (id INTEGER, name VARCHAR, email VARCHAR)")
-print(result)
+# Step 1: Create table
+table_schema = """
+CREATE TABLE table_name (
+    id INTEGER,
+    column1 VARCHAR,
+    column2 INTEGER,
+    column3 BOOLEAN
+)
+"""
+execute_query(table_schema)
+print("Table created successfully")
 
-# Insert data
-result = execute_query("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')")
-print(result)
+# Step 2: Insert data
+data_rows = [
+    (1, "value1", 100, True),
+    (2, "value2", 200, False),
+    # ... more rows
+]
 
-# Query data
-result = execute_query("SELECT * FROM users WHERE id = 1")
-print(result)
-```
+for row in data_rows:
+    id_val, col1, col2, col3 = row
+    # Format values correctly:
+    # - INTEGER: no quotes
+    # - VARCHAR: single quotes around string
+    # - BOOLEAN: true or false (lowercase)
+    insert_query = f"INSERT INTO table_name VALUES ({id_val}, '{col1}', {col2}, {col3})"
+    execute_query(insert_query)
+    print(f"Inserted row: {id_val}")
 
-### Example: Using JavaScript/Node.js
-
-```javascript
-const fetch = require('node-fetch');
-
-const BASE_URL = 'http://localhost:8080/api/execute';
-
-async function executeQuery(query) {
-    const response = await fetch(BASE_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query })
-    });
-    return await response.json();
-}
-
-// Create table
-executeQuery("CREATE TABLE users (id INTEGER, name VARCHAR, email VARCHAR)")
-    .then(result => console.log(result));
-
-// Insert data
-executeQuery("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')")
-    .then(result => console.log(result));
-
-// Query data
-executeQuery("SELECT * FROM users WHERE id = 1")
-    .then(result => console.log(result));
+# Step 3: Verify data (optional)
+result = execute_query("SELECT * FROM table_name")
+print(f"Total rows: {len(result['result']['rows'])}")
 ```
 
 ---
 
-## Library API Usage (Rust)
+## Data Type Formatting Rules
 
-If you're using VTDB as a Rust library, you can use the programmatic API:
+When generating SQL INSERT statements, format values as follows:
 
-```rust
-use vtdb::Database;
+| Data Type | Format | Example | Notes |
+|-----------|--------|---------|-------|
+| INTEGER | No quotes, numeric | `123`, `-42`, `1000` | Direct number |
+| VARCHAR | Single quotes | `'Hello World'`, `'Alice'` | Use single quotes, escape single quotes with `''` |
+| BOOLEAN | Lowercase | `true`, `false` | Must be lowercase |
 
-fn main() -> anyhow::Result<()> {
-    // Create a new database instance
-    let mut db = Database::new();
-    
-    // Execute SQL queries
-    let result = db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)")?;
-    
-    let result = db.execute("INSERT INTO users VALUES (1, 'Alice')")?;
-    
-    let result = db.execute("SELECT * FROM users WHERE id = 1")?;
-    
-    // Access results
-    println!("Columns: {:?}", result.columns);
-    println!("Rows: {:?}", result.rows);
-    
-    Ok(())
-}
-```
+**String Escaping:** If a VARCHAR value contains a single quote, escape it by doubling: `'O''Brien'` becomes `'O''Brien'`
 
-### QueryResult Structure
-
-```rust
-pub struct QueryResult {
-    pub rows: Vec<Vec<Value>>,      // Data rows
-    pub columns: Vec<String>,       // Column names
-}
-
-pub enum Value {
-    Integer(i64),
-    Varchar(String),
-    Boolean(bool),
-    Null,
-}
+**Example:**
+```sql
+INSERT INTO users VALUES (1, 'John O''Brien', 30, true)
 ```
 
 ---
 
 ## SQL Syntax Reference
-
-VTDB supports Snowflake-compatible SQL syntax for basic operations.
 
 ### CREATE TABLE
 
@@ -223,7 +198,9 @@ CREATE TABLE table_name (
 CREATE TABLE products (
     id INTEGER,
     name VARCHAR,
+    category VARCHAR,
     price INTEGER,
+    stock_quantity INTEGER,
     in_stock BOOLEAN
 )
 ```
@@ -236,31 +213,17 @@ INSERT INTO table_name VALUES (value1, value2, value3)
 
 **Example:**
 ```sql
-INSERT INTO products VALUES (1, 'Laptop', 999, true)
-INSERT INTO products VALUES (2, 'Mouse', 29, false)
+INSERT INTO products VALUES (1, 'Laptop', 'Electronics', 999, 45, true)
+INSERT INTO products VALUES (2, 'Mouse', 'Electronics', 29, 0, false)
 ```
 
-**Performance Note:** VTDB uses optimized batch insertion internally. When inserting multiple rows, each INSERT statement is processed efficiently using columnar batch insertion with pre-allocated memory. This provides excellent performance for bulk data loading operations.
+**Important:** Each INSERT statement inserts one row. For multiple rows, execute multiple INSERT statements sequentially.
 
 ### SELECT
 
 ```sql
 SELECT column1, column2 FROM table_name WHERE condition
 SELECT * FROM table_name WHERE condition
-```
-
-**Examples:**
-```sql
--- Select all columns
-SELECT * FROM products
-
--- Select specific columns
-SELECT name, price FROM products
-
--- Select with WHERE clause
-SELECT * FROM products WHERE price > 100
-SELECT * FROM products WHERE name = 'Laptop' AND in_stock = true
-SELECT * FROM products WHERE price < 50 OR in_stock = false
 ```
 
 **Supported WHERE operators:**
@@ -272,6 +235,14 @@ SELECT * FROM products WHERE price < 50 OR in_stock = false
 - `>=` (greater than or equal)
 - `AND` (logical AND)
 - `OR` (logical OR)
+
+**Examples:**
+```sql
+SELECT * FROM products
+SELECT name, price FROM products WHERE price > 100
+SELECT * FROM products WHERE name = 'Laptop' AND in_stock = true
+SELECT * FROM products WHERE price < 50 OR in_stock = false
+```
 
 ### UPDATE
 
@@ -299,180 +270,213 @@ DELETE FROM products WHERE price < 10
 
 ---
 
-## Data Types
+## Common Use Case Patterns
 
-VTDB supports the following data types:
+### Pattern 1: Load Data from List/Tuple
 
-| Type | Description | Example Values |
-|------|-------------|----------------|
-| `INTEGER` | 64-bit signed integer | `1`, `-42`, `1000` |
-| `VARCHAR` | Variable-length string | `'Hello'`, `"World"` |
-| `BOOLEAN` | Boolean value | `true`, `false` |
-
-**Note:** String literals can be enclosed in single quotes (`'text'`) or double quotes (`"text"`).
-
----
-
-## Sample Dataset Generation
-
-This section provides examples for generating sample datasets that can be loaded into VTDB.
-
-### Example 1: E-Commerce Products Dataset
-
-**Table Schema:**
-```sql
-CREATE TABLE products (
-    id INTEGER,
-    name VARCHAR,
-    category VARCHAR,
-    price INTEGER,
-    stock_quantity INTEGER,
-    in_stock BOOLEAN
-)
-```
-
-**Sample Data Generation (Python):**
-```python
-import random
-
-products = [
-    ("Laptop", "Electronics", 999),
-    ("Mouse", "Electronics", 29),
-    ("Keyboard", "Electronics", 79),
-    ("Monitor", "Electronics", 299),
-    ("Desk Chair", "Furniture", 199),
-    ("Desk", "Furniture", 299),
-    ("Lamp", "Furniture", 49),
-    ("Notebook", "Office Supplies", 5),
-    ("Pen", "Office Supplies", 2),
-    ("Stapler", "Office Supplies", 15),
-]
-
-def generate_inserts(table_name, products):
-    inserts = []
-    for i, (name, category, price) in enumerate(products, 1):
-        stock = random.randint(0, 100)
-        in_stock = stock > 0
-        insert = f"INSERT INTO {table_name} VALUES ({i}, '{name}', '{category}', {price}, {stock}, {in_stock})"
-        inserts.append(insert)
-    return inserts
-
-# Generate SQL INSERT statements
-inserts = generate_inserts("products", products)
-for insert in inserts:
-    print(insert)
-```
-
-**Generated SQL:**
-```sql
-INSERT INTO products VALUES (1, 'Laptop', 'Electronics', 999, 45, true)
-INSERT INTO products VALUES (2, 'Mouse', 'Electronics', 29, 0, false)
-INSERT INTO products VALUES (3, 'Keyboard', 'Electronics', 79, 23, true)
--- ... more rows
-```
-
-### Example 2: User Management Dataset
-
-**Table Schema:**
-```sql
-CREATE TABLE users (
-    id INTEGER,
-    username VARCHAR,
-    email VARCHAR,
-    age INTEGER,
-    active BOOLEAN
-)
-```
-
-**Sample Data Generation (JavaScript):**
-```javascript
-const names = ['Alice', 'Bob', 'Charlie', 'Diana', 'Eve', 'Frank', 'Grace', 'Henry'];
-const domains = ['example.com', 'test.com', 'demo.org'];
-
-function generateUsers(count) {
-    const inserts = [];
-    for (let i = 1; i <= count; i++) {
-        const name = names[Math.floor(Math.random() * names.length)];
-        const email = `${name.toLowerCase()}@${domains[Math.floor(Math.random() * domains.length)]}`;
-        const age = Math.floor(Math.random() * 50) + 18;
-        const active = Math.random() > 0.3;
-        inserts.push(`INSERT INTO users VALUES (${i}, '${name}', '${email}', ${age}, ${active})`);
-    }
-    return inserts;
-}
-
-const inserts = generateUsers(20);
-inserts.forEach(insert => console.log(insert));
-```
-
-### Example 3: Sales Transactions Dataset
-
-**Table Schema:**
-```sql
-CREATE TABLE sales (
-    id INTEGER,
-    product_id INTEGER,
-    customer_id INTEGER,
-    quantity INTEGER,
-    total_amount INTEGER,
-    sale_date VARCHAR
-)
-```
-
-**Sample Data Generation (Python):**
-```python
-import random
-from datetime import datetime, timedelta
-
-def generate_sales(count, product_count, customer_count):
-    inserts = []
-    start_date = datetime(2024, 1, 1)
-    
-    for i in range(1, count + 1):
-        product_id = random.randint(1, product_count)
-        customer_id = random.randint(1, customer_count)
-        quantity = random.randint(1, 10)
-        unit_price = random.randint(10, 500)
-        total_amount = quantity * unit_price
-        
-        days_offset = random.randint(0, 365)
-        sale_date = (start_date + timedelta(days=days_offset)).strftime('%Y-%m-%d')
-        
-        insert = f"INSERT INTO sales VALUES ({i}, {product_id}, {customer_id}, {quantity}, {total_amount}, '{sale_date}')"
-        inserts.append(insert)
-    
-    return inserts
-
-inserts = generate_sales(100, 10, 50)
-for insert in inserts:
-    print(insert)
-```
-
----
-
-## Loading Data
-
-### Method 1: Using REST API (Recommended for External Applications)
-
-**Python Script:**
 ```python
 import requests
-import json
 
 BASE_URL = "http://localhost:8080/api/execute"
 
 def execute_query(query):
-    response = requests.post(
-        BASE_URL,
-        json={"query": query},
-        headers={"Content-Type": "application/json"}
-    )
+    response = requests.post(BASE_URL, json={"query": query}, headers={"Content-Type": "application/json"})
     result = response.json()
-    if not result["success"]:
-        raise Exception(f"Query failed: {result.get('error')}")
+    if not result.get("success"):
+        raise Exception(result.get("error"))
+    return result
+
+# Define data
+data = [
+    (1, "Alice", "alice@example.com", 25, True),
+    (2, "Bob", "bob@example.com", 30, False),
+    (3, "Charlie", "charlie@example.com", 35, True),
+]
+
+# Create table
+execute_query("""
+    CREATE TABLE users (
+        id INTEGER,
+        name VARCHAR,
+        email VARCHAR,
+        age INTEGER,
+        active BOOLEAN
+    )
+""")
+
+# Insert data
+for id_val, name, email, age, active in data:
+    query = f"INSERT INTO users VALUES ({id_val}, '{name}', '{email}', {age}, {active})"
+    execute_query(query)
+```
+
+### Pattern 2: Load Data from Dictionary
+
+```python
+import requests
+
+BASE_URL = "http://localhost:8080/api/execute"
+
+def execute_query(query):
+    response = requests.post(BASE_URL, json={"query": query}, headers={"Content-Type": "application/json"})
+    result = response.json()
+    if not result.get("success"):
+        raise Exception(result.get("error"))
+    return result
+
+# Define data as dictionaries
+data = [
+    {"id": 1, "name": "Laptop", "price": 999, "in_stock": True},
+    {"id": 2, "name": "Mouse", "price": 29, "in_stock": False},
+    {"id": 3, "name": "Keyboard", "price": 79, "in_stock": True},
+]
+
+# Create table
+execute_query("""
+    CREATE TABLE products (
+        id INTEGER,
+        name VARCHAR,
+        price INTEGER,
+        in_stock BOOLEAN
+    )
+""")
+
+# Insert data
+for row in data:
+    name_escaped = row["name"].replace("'", "''")  # Escape single quotes
+    query = f"INSERT INTO products VALUES ({row['id']}, '{name_escaped}', {row['price']}, {row['in_stock']})"
+    execute_query(query)
+```
+
+### Pattern 3: Generate and Load Sample Data
+
+```python
+import requests
+import random
+
+BASE_URL = "http://localhost:8080/api/execute"
+
+def execute_query(query):
+    response = requests.post(BASE_URL, json={"query": query}, headers={"Content-Type": "application/json"})
+    result = response.json()
+    if not result.get("success"):
+        raise Exception(result.get("error"))
     return result
 
 # Create table
+execute_query("""
+    CREATE TABLE sales (
+        id INTEGER,
+        product_id INTEGER,
+        customer_id INTEGER,
+        quantity INTEGER,
+        total_amount INTEGER,
+        sale_date VARCHAR
+    )
+""")
+
+# Generate and insert sample data
+for i in range(1, 101):  # Generate 100 rows
+    product_id = random.randint(1, 10)
+    customer_id = random.randint(1, 50)
+    quantity = random.randint(1, 10)
+    total_amount = random.randint(10, 5000)
+    sale_date = f"2024-{random.randint(1,12):02d}-{random.randint(1,28):02d}"
+    
+    query = f"INSERT INTO sales VALUES ({i}, {product_id}, {customer_id}, {quantity}, {total_amount}, '{sale_date}')"
+    execute_query(query)
+    
+    if i % 10 == 0:
+        print(f"Inserted {i} rows...")
+```
+
+### Pattern 4: Load Data with Error Handling
+
+```python
+import requests
+import sys
+
+BASE_URL = "http://localhost:8080/api/execute"
+
+def execute_query(query, verbose=True):
+    try:
+        response = requests.post(
+            BASE_URL,
+            json={"query": query},
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        result = response.json()
+        
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            if verbose:
+                print(f"Error executing query: {error}")
+                print(f"Query: {query}")
+            return None
+        
+        return result
+    except requests.exceptions.RequestException as e:
+        if verbose:
+            print(f"Request failed: {e}")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"Unexpected error: {e}")
+        return None
+
+# Create table
+result = execute_query("""
+    CREATE TABLE products (
+        id INTEGER,
+        name VARCHAR,
+        price INTEGER
+    )
+""")
+
+if result is None:
+    print("Failed to create table")
+    sys.exit(1)
+
+# Load data with error handling
+data = [
+    (1, "Laptop", 999),
+    (2, "Mouse", 29),
+    (3, "Keyboard", 79),
+]
+
+success_count = 0
+for id_val, name, price in data:
+    query = f"INSERT INTO products VALUES ({id_val}, '{name}', {price})"
+    result = execute_query(query)
+    if result:
+        success_count += 1
+        print(f"Inserted: {name}")
+    else:
+        print(f"Failed to insert: {name}")
+
+print(f"\nSuccessfully inserted {success_count} out of {len(data)} rows")
+```
+
+---
+
+## Complete Example Scripts
+
+### Example 1: E-Commerce Products
+
+```python
+import requests
+
+BASE_URL = "http://localhost:8080/api/execute"
+
+def execute_query(query):
+    response = requests.post(BASE_URL, json={"query": query}, headers={"Content-Type": "application/json"})
+    result = response.json()
+    if not result.get("success"):
+        raise Exception(f"Query failed: {result.get('error')}")
+    return result
+
+# Create products table
 execute_query("""
     CREATE TABLE products (
         id INTEGER,
@@ -484,174 +488,169 @@ execute_query("""
     )
 """)
 
-# Load data
-data = [
+# Insert product data
+products = [
     (1, "Laptop", "Electronics", 999, 45, True),
     (2, "Mouse", "Electronics", 29, 0, False),
     (3, "Keyboard", "Electronics", 79, 23, True),
+    (4, "Monitor", "Electronics", 299, 12, True),
+    (5, "Desk Chair", "Furniture", 199, 8, True),
+    (6, "Desk", "Furniture", 299, 5, True),
+    (7, "Lamp", "Furniture", 49, 15, True),
+    (8, "Notebook", "Office Supplies", 5, 100, True),
+    (9, "Pen", "Office Supplies", 2, 200, True),
+    (10, "Stapler", "Office Supplies", 15, 30, True),
 ]
 
-for row in data:
-    id_val, name, category, price, stock, in_stock = row
+for id_val, name, category, price, stock, in_stock in products:
     query = f"INSERT INTO products VALUES ({id_val}, '{name}', '{category}', {price}, {stock}, {in_stock})"
     execute_query(query)
     print(f"Inserted: {name}")
+
+# Verify
+result = execute_query("SELECT COUNT(*) FROM products")
+print(f"\nTotal products: {result['result']['rows'][0][0]}")
 ```
 
-**Bash Script:**
-```bash
-#!/bin/bash
-
-BASE_URL="http://localhost:8080/api/execute"
-
-execute_query() {
-    curl -X POST "$BASE_URL" \
-        -H "Content-Type: application/json" \
-        -d "{\"query\": \"$1\"}" | jq .
-}
-
-# Create table
-execute_query "CREATE TABLE products (id INTEGER, name VARCHAR, category VARCHAR, price INTEGER, stock_quantity INTEGER, in_stock BOOLEAN)"
-
-# Insert data
-execute_query "INSERT INTO products VALUES (1, 'Laptop', 'Electronics', 999, 45, true)"
-execute_query "INSERT INTO products VALUES (2, 'Mouse', 'Electronics', 29, 0, false)"
-execute_query "INSERT INTO products VALUES (3, 'Keyboard', 'Electronics', 79, 23, true)"
-```
-
-### Method 2: Using Rust Library
-
-```rust
-use vtdb::Database;
-
-fn main() -> anyhow::Result<()> {
-    let mut db = Database::new();
-    
-    // Create table
-    db.execute("CREATE TABLE products (id INTEGER, name VARCHAR, category VARCHAR, price INTEGER, stock_quantity INTEGER, in_stock BOOLEAN)")?;
-    
-    // Insert data
-    let inserts = vec![
-        "INSERT INTO products VALUES (1, 'Laptop', 'Electronics', 999, 45, true)",
-        "INSERT INTO products VALUES (2, 'Mouse', 'Electronics', 29, 0, false)",
-        "INSERT INTO products VALUES (3, 'Keyboard', 'Electronics', 79, 23, true)",
-    ];
-    
-    for insert in inserts {
-        db.execute(insert)?;
-    }
-    
-    // Query data
-    let result = db.execute("SELECT * FROM products WHERE in_stock = true")?;
-    println!("In-stock products: {:?}", result.rows);
-    
-    Ok(())
-}
-```
-
-### Method 3: Using Web Interface
-
-1. Start the server: `cargo run --bin vtdb`
-2. Open `http://localhost:8080` in your browser
-3. **Table Explorer**: Use the sidebar on the left to view all tables in your database
-   - Click the refresh button (↻) to reload the table list
-   - Click on any table name to automatically insert `SELECT * FROM <table>` into the editor
-4. Execute SQL queries directly in the Monaco editor
-5. Use the example query buttons or type your own queries
-
----
-
-## Tips for LLM Dataset Generation
-
-When instructing an LLM to generate sample datasets for VTDB:
-
-1. **Specify the table schema** with column names and data types
-2. **Request SQL INSERT statements** in the format: `INSERT INTO table_name VALUES (value1, value2, ...)`
-3. **Ensure data type compatibility:**
-   - INTEGER values should be numbers without quotes
-   - VARCHAR values should be strings in single quotes: `'text'`
-   - BOOLEAN values should be `true` or `false` (lowercase)
-4. **Provide realistic sample data** appropriate for the domain
-5. **Include multiple rows** (10-100 rows is a good starting point)
-6. **Consider relationships** if generating multiple related tables
-
-**Example LLM Prompt:**
-```
-Generate a sample dataset for VTDB with the following schema:
-- Table: products (id INTEGER, name VARCHAR, category VARCHAR, price INTEGER, stock_quantity INTEGER, in_stock BOOLEAN)
-- Generate 20 rows of realistic e-commerce product data
-- Output SQL INSERT statements that can be executed directly
-- Ensure all data types match the schema
-```
-
----
-
-## Performance Optimizations
-
-VTDB includes several performance optimizations for efficient data operations:
-
-### Batch Insert Optimization
-
-VTDB uses optimized batch insertion for improved performance when inserting data:
-
-- **Columnar Batch Insertion**: Multiple rows are inserted using columnar batch operations, which is significantly faster than row-by-row insertion
-- **Memory Pre-allocation**: Column vectors are pre-allocated with the expected capacity to avoid reallocations
-- **Single Validation**: Batch validation checks all rows once before insertion, reducing overhead
-- **Batched WAL Writes**: Write-Ahead Log entries are written once per batch instead of per-row
-
-**Performance Benefits:**
-- **3-5x faster** for batches of 100+ rows compared to row-by-row insertion
-- **Reduced memory allocations** through pre-allocation and bulk operations
-- **Lower overhead** for large data loading operations
-
-**Best Practices:**
-- When loading large datasets, insert multiple rows in sequence - each INSERT statement benefits from batch optimization
-- For bulk loading, consider inserting rows in batches of 100-1000 rows per transaction for optimal performance
-- The optimization is automatic - no special syntax or configuration needed
-
-### Table Explorer
-
-The web interface includes a table explorer sidebar that provides:
-- **Quick table discovery**: View all tables in your database at a glance
-- **Fast query generation**: Click any table to generate a `SELECT * FROM <table>` query
-- **Real-time updates**: Refresh button to reload the table list after creating new tables
-
----
-
-## Error Handling
-
-When using the REST API, always check the `success` field in the response:
+### Example 2: User Management
 
 ```python
-response = execute_query("SELECT * FROM nonexistent_table")
-if not response["success"]:
-    print(f"Error: {response['error']}")
-else:
-    print(f"Results: {response['result']}")
+import requests
+import random
+
+BASE_URL = "http://localhost:8080/api/execute"
+
+def execute_query(query):
+    response = requests.post(BASE_URL, json={"query": query}, headers={"Content-Type": "application/json"})
+    result = response.json()
+    if not result.get("success"):
+        raise Exception(f"Query failed: {result.get('error')}")
+    return result
+
+# Create users table
+execute_query("""
+    CREATE TABLE users (
+        id INTEGER,
+        username VARCHAR,
+        email VARCHAR,
+        age INTEGER,
+        active BOOLEAN
+    )
+""")
+
+# Generate and insert user data
+names = ["Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry"]
+domains = ["example.com", "test.com", "demo.org"]
+
+for i in range(1, 21):
+    name = random.choice(names)
+    username = name.lower()
+    email = f"{username}@{random.choice(domains)}"
+    age = random.randint(18, 65)
+    active = random.choice([True, False])
+    
+    query = f"INSERT INTO users VALUES ({i}, '{username}', '{email}', {age}, {active})"
+    execute_query(query)
+
+print("Inserted 20 users")
+
+# Query active users
+result = execute_query("SELECT * FROM users WHERE active = true")
+print(f"\nActive users: {len(result['result']['rows'])}")
 ```
 
-Common errors:
-- `Table 'table_name' does not exist` - Table hasn't been created yet
-- `Column 'column_name' not found` - Column name is incorrect
-- `Unsupported data type` - Data type not supported by VTDB
-- `Invalid SQL syntax` - SQL statement has syntax errors
+---
+
+## Error Handling Guide
+
+### Common Errors and Solutions
+
+| Error Message | Cause | Solution |
+|---------------|-------|----------|
+| `Table 'table_name' does not exist` | Table not created | Create table first with CREATE TABLE |
+| `Column 'column_name' not found` | Wrong column name | Check column names match schema |
+| `Unsupported data type` | Invalid data type | Use only INTEGER, VARCHAR, BOOLEAN |
+| `Invalid SQL syntax` | SQL syntax error | Check SQL statement syntax |
+| Connection refused | Server not running | Start VTDB server first |
+
+### Error Handling Pattern
+
+```python
+import requests
+
+BASE_URL = "http://localhost:8080/api/execute"
+
+def execute_query(query):
+    response = requests.post(BASE_URL, json={"query": query}, headers={"Content-Type": "application/json"})
+    result = response.json()
+    
+    if not result.get("success"):
+        error = result.get("error", "Unknown error")
+        print(f"Error: {error}")
+        print(f"Query: {query}")
+        return None
+    
+    return result
+
+# Use with error checking
+result = execute_query("SELECT * FROM nonexistent_table")
+if result is None:
+    print("Query failed, skipping...")
+else:
+    print(f"Results: {result['result']['rows']}")
+```
+
+---
+
+## Server Setup
+
+### Using Docker (Recommended)
+
+```bash
+docker-compose up --build
+```
+
+Server will be available at `http://localhost:8080`
+
+### Running Locally
+
+```bash
+./start-server.sh
+# or
+cargo run --release
+```
+
+---
+
+## Key Points for LLMs
+
+When generating scripts for VTDB:
+
+1. **Always create the table first** using CREATE TABLE before inserting data
+2. **Format values correctly:**
+   - INTEGER: no quotes (e.g., `123`)
+   - VARCHAR: single quotes (e.g., `'text'`)
+   - BOOLEAN: lowercase `true` or `false`
+3. **Escape single quotes in strings** by doubling them: `'O''Brien'`
+4. **Each INSERT statement inserts one row** - loop through data to insert multiple rows
+5. **Check for errors** by examining the `success` field in the response
+6. **Use the execute_query pattern** shown in templates for consistency
+7. **Server must be running** before executing queries - default URL is `http://localhost:8080`
 
 ---
 
 ## Limitations
 
-- **No transactions**: Each query is executed independently
-- **In-memory storage**: Data is lost when the server restarts (unless persistence is enabled)
-- **Single connection**: The REST API uses a single shared database instance
-- **Basic SQL**: Only basic CRUD operations are supported (no JOINs, subqueries, etc.)
-- **Limited data types**: Only INTEGER, VARCHAR, and BOOLEAN are supported
+- **No transactions**: Each query executes independently
+- **Data types**: Only INTEGER, VARCHAR, BOOLEAN supported
+- **Basic SQL**: No JOINs, subqueries, or advanced features
+- **Single connection**: REST API uses shared database instance
+- **Data persistence**: Data stored in `./data` directory (Iceberg format)
 
 ---
 
-## Next Steps
+## Additional Resources
 
-- Check the [README.md](README.md) for project overview
-- Explore the web interface at `http://localhost:8080`
-- Review test files in `tests/` for more examples
-- Check the source code for implementation details
-
+- See `README.md` for project overview
+- Web interface available at `http://localhost:8080` when server is running
+- Test files in `tests/` directory provide more examples

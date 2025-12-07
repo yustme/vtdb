@@ -1,0 +1,42 @@
+# Git
+.git/
+.gitignore
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+!README.md
+
+# Scripts
+*.sh
+
+# Tests
+tests/
+test_*.rs
+
+# Data directory (mounted as volume, don't copy into image)
+data/
+
+# Docker files
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# Cache-busting version file
+web/.js-version
+
